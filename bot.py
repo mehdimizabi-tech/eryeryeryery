@@ -42,8 +42,8 @@ client = TelegramClient(BOT_SESSION, API_ID, API_HASH)
 # ------------------ متغیرهای درون حافظه ------------------
 
 ADMINS = set()
-INVITE_DELAY = 60          # ثانیه، در حالت fixed
-INVITE_DELAY_MODE = "fixed"  # "fixed" یا "random"
+INVITE_DELAY = 60             # ثانیه، در حالت fixed
+INVITE_DELAY_MODE = "fixed"   # "fixed" یا "random" (30-100)
 
 # فقط اکانت‌های نوع add را در حافظه نگه می‌داریم
 ACCOUNTS_ADD = []  # list of dicts: {id, name, phone, api_id, api_hash, session_string}
@@ -441,7 +441,7 @@ async def handle_state_message(event, state):
     step = state.get("step")
     temp = state.get("temp", {})
 
-    # ---------- افزودن اکانت add با لاگین کد ----------
+    # ---------- افزودن اکانت add با لاگین کد + 2FA ----------
     if mode == "addacc":
         if step == "name":
             name = text
@@ -522,6 +522,7 @@ async def handle_state_message(event, state):
                     code=code,
                     phone_code_hash=phone_code_hash
                 )
+                # موفق بدون نیاز به 2FA
                 session_string = acc_client.session.save()
                 await acc_client.disconnect()
                 login_clients_add.pop(user_id, None)
@@ -552,18 +553,80 @@ async def handle_state_message(event, state):
                 await event.reply(f"✅ اکانت `{name}` برای add user ثبت و لاگین شد.", parse_mode="markdown")
                 await send_main_menu(chat_id)
 
+            except SessionPasswordNeededError:
+                # اکانت 2FA دارد → رمز دو مرحله‌ای را بخواه
+                state["step"] = "2fa"
+                state["temp"] = temp
+                user_states[user_id] = state
+                await event.reply(
+                    "برای این اکانت رمز دو مرحله‌ای (2FA) فعال است.\n"
+                    "رمز دو مرحله‌ای این اکانت را همینجا بفرست:"
+                )
             except PhoneCodeExpiredError:
                 await event.reply("کد منقضی شده. دوباره دکمه «➕ افزودن اکانت» را بزن و از اول شروع کن.")
                 await acc_client.disconnect()
                 login_clients_add.pop(user_id, None)
                 user_states.pop(user_id, None)
-            except SessionPasswordNeededError:
-                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
+            except Exception as e:
+                await event.reply(f"خطا در لاگین:\n{e}")
+                traceback.print_exc()
                 await acc_client.disconnect()
                 login_clients_add.pop(user_id, None)
                 user_states.pop(user_id, None)
+            return
+
+        if step == "2fa":
+            # رمز دو مرحله‌ای برای اکانت add
+            password = text
+            phone = temp["phone"]
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
+            name = temp["name"]
+
+            acc_client = login_clients_add.get(user_id)
+            if not acc_client:
+                await event.reply("سشن لاگین پیدا نشد. دوباره ➕ افزودن اکانت را بزن.")
+                user_states.pop(user_id, None)
+                return
+
+            try:
+                # اینجا فقط password را می‌دیم، قبلاً code را داده بودیم
+                await acc_client.sign_in(password=password)
+                session_string = acc_client.session.save()
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+
+                acc_id = insert_account(
+                    name=name,
+                    phone=phone,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_string=session_string,
+                    kind="add"
+                )
+
+                ACCOUNTS_ADD.append({
+                    "id": acc_id,
+                    "name": name,
+                    "phone": phone,
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "session_string": session_string,
+                })
+
+                if not ACTIVE_ADD_ACCOUNT:
+                    ACTIVE_ADD_ACCOUNT = name
+                    set_setting("active_add_account", name)
+
+                user_states.pop(user_id, None)
+                await event.reply(
+                    f"✅ اکانت `{name}` (با 2FA) برای add user ثبت و لاگین شد.",
+                    parse_mode="markdown"
+                )
+                await send_main_menu(chat_id)
+
             except Exception as e:
-                await event.reply(f"خطا در لاگین:\n{e}")
+                await event.reply(f"خطا در لاگین با رمز دو مرحله‌ای:\n{e}")
                 traceback.print_exc()
                 await acc_client.disconnect()
                 login_clients_add.pop(user_id, None)
@@ -625,7 +688,7 @@ async def handle_state_message(event, state):
             name = acc_info["name"]
 
             delete_account_by_id(acc_id)
-            ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
+            ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
 
             if ACTIVE_ADD_ACCOUNT == name:
                 ACTIVE_ADD_ACCOUNT = None
@@ -664,7 +727,7 @@ async def handle_state_message(event, state):
             await event.reply("حالا chat_id گروه را بفرست (مثلاً -1001234567890):")
             return
 
-    # ---------- ویزارد لاگین اکانت export با کد ----------
+    # ---------- ویزارد لاگین اکانت export با کد + 2FA ----------
     if mode == "export_login":
         if step == "name":
             name = text
@@ -744,6 +807,7 @@ async def handle_state_message(event, state):
                     code=code,
                     phone_code_hash=phone_code_hash
                 )
+                # موفق بدون 2FA
                 session_string = exp_client.session.save()
                 await exp_client.disconnect()
                 login_clients_export.pop(user_id, None)
@@ -764,18 +828,68 @@ async def handle_state_message(event, state):
                     "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست:",
                     parse_mode="markdown"
                 )
+
+            except SessionPasswordNeededError:
+                # لازم است رمز دو مرحله‌ای بخواهیم
+                state["step"] = "2fa"
+                state["temp"] = temp
+                user_states[user_id] = state
+                await event.reply(
+                    "برای این اکانت export رمز دو مرحله‌ای (2FA) فعال است.\n"
+                    "رمز دو مرحله‌ای این اکانت را همینجا بفرست:"
+                )
             except PhoneCodeExpiredError:
                 await event.reply("کد منقضی شده. دوباره دکمه 📤 خروج اعضا را بزن و از اول شروع کن.")
                 await exp_client.disconnect()
                 login_clients_export.pop(user_id, None)
                 user_states.pop(user_id, None)
-            except SessionPasswordNeededError:
-                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
+            except Exception as e:
+                await event.reply(f"خطا در لاگین:\n{e}")
+                traceback.print_exc()
                 await exp_client.disconnect()
                 login_clients_export.pop(user_id, None)
                 user_states.pop(user_id, None)
+            return
+
+        if step == "2fa":
+            # رمز دو مرحله‌ای برای اکانت export
+            password = text
+            name = temp["name"]
+            phone = temp["phone"]
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
+
+            exp_client = login_clients_export.get(user_id)
+            if not exp_client:
+                await event.reply("سشن لاگین export پیدا نشد. دوباره 📤 خروج اعضا را بزن.")
+                user_states.pop(user_id, None)
+                return
+
+            try:
+                await exp_client.sign_in(password=password)
+                session_string = exp_client.session.save()
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
+
+                acc_id = insert_account(
+                    name=name,
+                    phone=phone,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_string=session_string,
+                    kind="export"
+                )
+
+                temp2 = {"account_id": acc_id}
+                user_states[user_id] = {"mode": "export_chat", "step": "chat_id", "temp": temp2}
+                await event.reply(
+                    f"✅ اکانت export `{name}` (با 2FA) لاگین شد.\n"
+                    "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست:",
+                    parse_mode="markdown"
+                )
+
             except Exception as e:
-                await event.reply(f"خطا در لاگین:\n{e}")
+                await event.reply(f"خطا در لاگین با رمز دو مرحله‌ای:\n{e}")
                 traceback.print_exc()
                 await exp_client.disconnect()
                 login_clients_export.pop(user_id, None)
@@ -1069,7 +1183,7 @@ async def main_handler(event):
             return
         acc_id = acc["id"]
         delete_account_by_id(acc_id)
-        ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
+        ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
         if ACTIVE_ADD_ACCOUNT == name:
             ACTIVE_ADD_ACCOUNT = None
             set_setting("active_add_account", "")
