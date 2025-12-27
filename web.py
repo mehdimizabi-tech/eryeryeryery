@@ -2,11 +2,11 @@ import os
 import threading
 
 from aiohttp import web
-import bot  # همین bot.py خودت
+import bot  # همین bot.py
 
 
 def start_bot():
-    # ربات تلگرامی رو تو یه ترد جداگانه بالا می‌آرم تا وب‌سرور همزمان کار کنه
+    # ربات تلگرام را در یک ترد جداگانه بالا می‌آوریم
     t = threading.Thread(target=bot.main, daemon=True)
     t.start()
 
@@ -16,10 +16,10 @@ async def handle_root(request):
 
 
 def main():
-    # اول ربات رو استارت کن
+    # اول ربات را استارت می‌کنیم
     start_bot()
 
-    # بعد وب‌سرور aiohttp رو بالا بیار
+    # بعد وب‌سرور aiohttp را بالا می‌آوریم
     app = web.Application()
     app.router.add_get("/", handle_root)
 
@@ -27,5 +27,5 @@ def main():
     web.run_app(app, host="0.0.0.0", port=port)
 
 
-if name == "main":
+if __name__ == "__main__":
     main()
