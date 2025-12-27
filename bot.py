@@ -4,6 +4,7 @@ import io
 import re
 import asyncio
 import traceback
+import random  # برای تاخیر رندوم
 
 import psycopg
 from psycopg.rows import dict_row
@@ -41,7 +42,8 @@ client = TelegramClient(BOT_SESSION, API_ID, API_HASH)
 # ------------------ متغیرهای درون حافظه ------------------
 
 ADMINS = set()
-INVITE_DELAY = 60  # ثانیه
+INVITE_DELAY = 60          # ثانیه، در حالت fixed
+INVITE_DELAY_MODE = "fixed"  # "fixed" یا "random"
 
 # فقط اکانت‌های نوع add را در حافظه نگه می‌داریم
 ACCOUNTS_ADD = []  # list of dicts: {id, name, phone, api_id, api_hash, session_string}
@@ -146,9 +148,10 @@ def remove_admin_db(user_id: int):
 
 
 def load_settings_from_db():
-    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT
+    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, INVITE_DELAY_MODE
     with get_db_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            # مقدار delay
             cur.execute("SELECT value FROM settings WHERE key = 'invite_delay'")
             row = cur.fetchone()
             if row:
@@ -159,6 +162,15 @@ def load_settings_from_db():
             else:
                 INVITE_DELAY = 60
 
+            # مود delay (fixed / random)
+            cur.execute("SELECT value FROM settings WHERE key = 'invite_delay_mode'")
+            row = cur.fetchone()
+            if row and row["value"] in ("fixed", "random"):
+                INVITE_DELAY_MODE = row["value"]
+            else:
+                INVITE_DELAY_MODE = "fixed"
+
+            # اکانت فعال
             cur.execute("SELECT value FROM settings WHERE key = 'active_add_account'")
             row = cur.fetchone()
             if row:
@@ -394,7 +406,14 @@ async def add_users_from_csv_file(file_path, chat_id):
             await user_client(InviteToChannelRequest(target_entity, [user_entity]))
             await client.send_message(chat_id, f"✅ اضافه شد: {username_or_id}")
 
-            await asyncio.sleep(INVITE_DELAY)
+            # تاخیر بین هر اد
+            if INVITE_DELAY_MODE == "random":
+                delay = random.randint(30, 100)
+            else:
+                delay = INVITE_DELAY
+                if delay < 1:
+                    delay = 1
+            await asyncio.sleep(delay)
 
         except PeerFloodError:
             await client.send_message(chat_id, "⛔ خطای Flood از سمت تلگرام. روند متوقف شد.")
@@ -413,7 +432,7 @@ async def add_users_from_csv_file(file_path, chat_id):
 
 async def handle_state_message(event, state):
     """هدل کردن ویزاردها"""
-    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD
+    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD, INVITE_DELAY_MODE
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -553,17 +572,42 @@ async def handle_state_message(event, state):
 
     # ---------- تنظیم تاخیر ----------
     if mode == "setdelay":
-        if not text.isdigit():
-            await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
+        # مرحله انتخاب مود
+        if step == "mode":
+            lower = text.strip().lower()
+            if lower in ("1", "ثابت", "fixed"):
+                # می‌ریم سراغ گرفتن مقدار ثابت
+                state["step"] = "value"
+                state["temp"] = {}
+                user_states[user_id] = state
+                await event.reply("عدد تاخیر بین ادها (ثانیه) را بفرست:")
+                return
+            elif lower in ("2", "رندوم", "random"):
+                INVITE_DELAY_MODE = "random"
+                set_setting("invite_delay_mode", "random")
+                user_states.pop(user_id, None)
+                await event.reply("✅ حالت تاخیر روی «رندوم بین 30 تا 100 ثانیه» تنظیم شد.")
+                await send_main_menu(chat_id)
+                return
+            else:
+                await event.reply("فقط عدد 1 (ثابت) یا 2 (رندوم) را بفرست.")
+                return
+
+        # مرحله گرفتن مقدار ثابت
+        if step == "value":
+            if not text.isdigit():
+                await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
+                return
+            INVITE_DELAY = int(text)
+            if INVITE_DELAY < 1:
+                INVITE_DELAY = 1
+            INVITE_DELAY_MODE = "fixed"
+            set_setting("invite_delay", str(INVITE_DELAY))
+            set_setting("invite_delay_mode", "fixed")
+            user_states.pop(user_id, None)
+            await event.reply(f"✅ تاخیر بین ادها به صورت ثابت روی {INVITE_DELAY} ثانیه تنظیم شد.")
+            await send_main_menu(chat_id)
             return
-        INVITE_DELAY = int(text)
-        if INVITE_DELAY < 1:
-            INVITE_DELAY = 1
-        set_setting("invite_delay", str(INVITE_DELAY))
-        user_states.pop(user_id, None)
-        await event.reply(f"✅ تاخیر بین ادها روی {INVITE_DELAY} ثانیه تنظیم شد.")
-        await send_main_menu(chat_id)
-        return
 
     # ---------- حذف اکانت add ----------
     if mode == "delacc_wizard":
@@ -853,7 +897,7 @@ async def handle_state_message(event, state):
 
 @client.on(events.NewMessage)
 async def main_handler(event):
-    global awaiting_group_number, target_group, ACTIVE_ADD_ACCOUNT, INVITE_DELAY, ACCOUNTS_ADD
+    global awaiting_group_number, target_group, ACTIVE_ADD_ACCOUNT, INVITE_DELAY, ACCOUNTS_ADD, INVITE_DELAY_MODE
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -886,7 +930,7 @@ async def main_handler(event):
                 "/delacc <name> → حذف اکانت add\n"
                 "/admins → لیست ادمین‌ها\n"
                 "/addadmin <id> /deladmin <id>\n"
-                "/setdelay <sec> → تاخیر اد از CSV",
+                "/setdelay <sec|random> → تاخیر اد از CSV",
             )
             await send_main_menu(chat_id)
         else:
@@ -955,19 +999,34 @@ async def main_handler(event):
     # تنظیم تاخیر با دستور
     if text.startswith("/setdelay"):
         parts = text.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            INVITE_DELAY = int(parts[1])
-            if INVITE_DELAY < 1:
-                INVITE_DELAY = 1
-            set_setting("invite_delay", str(INVITE_DELAY))
-            await event.reply(f"✅ تاخیر بین ادها روی {INVITE_DELAY} ثانیه تنظیم شد.")
+        if len(parts) == 2:
+            arg = parts[1].strip().lower()
+            if arg.isdigit():
+                INVITE_DELAY = int(arg)
+                if INVITE_DELAY < 1:
+                    INVITE_DELAY = 1
+                INVITE_DELAY_MODE = "fixed"
+                set_setting("invite_delay", str(INVITE_DELAY))
+                set_setting("invite_delay_mode", "fixed")
+                await event.reply(f"✅ تاخیر بین ادها به صورت ثابت روی {INVITE_DELAY} ثانیه تنظیم شد.")
+            elif arg in ("random", "rand"):
+                INVITE_DELAY_MODE = "random"
+                set_setting("invite_delay_mode", "random")
+                await event.reply("✅ حالت تاخیر روی «رندوم بین 30 تا 100 ثانیه» تنظیم شد.")
+            else:
+                await event.reply("فرمت درست: `/setdelay <seconds>` یا `/setdelay random`", parse_mode="markdown")
         else:
-            await event.reply("فرمت درست: `/setdelay <seconds>`", parse_mode="markdown")
+            await event.reply("فرمت درست: `/setdelay <seconds>` یا `/setdelay random`", parse_mode="markdown")
         return
 
     if text == "⏱ تنظیم تاخیر":
-        user_states[user_id] = {"mode": "setdelay", "step": "value", "temp": {}}
-        await event.reply("عدد تاخیر بین ادها (ثانیه) را بفرست:")
+        user_states[user_id] = {"mode": "setdelay", "step": "mode", "temp": {}}
+        await event.reply(
+            "نوع تاخیر را انتخاب کن:\n"
+            "1️⃣ ثابت (عدد ثانیه مشخص)\n"
+            "2️⃣ رندوم بین 30 تا 100 ثانیه\n\n"
+            "فقط عدد 1 یا 2 را بفرست."
+        )
         return
 
     # ----------- مدیریت اکانت‌های add -----------
@@ -1132,7 +1191,7 @@ async def run_bot():
     print("Initializing DB and loading data...")
     init_db()
     print("Admins:", ADMINS)
-    print("Invite delay:", INVITE_DELAY)
+    print("Invite delay:", INVITE_DELAY, "mode:", INVITE_DELAY_MODE)
     print("Loaded add-accounts:", [a["name"] for a in ACCOUNTS_ADD])
 
     print("Bot starting (async)...")
