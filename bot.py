@@ -4,7 +4,9 @@ import io
 import re
 import asyncio
 import traceback
-import json
+
+import psycopg2
+import psycopg2.extras
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import GetDialogsRequest
@@ -12,162 +14,278 @@ from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.errors.rpcerrorlist import PeerFloodError, UserPrivacyRestrictedError
 from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
+from telethon.sessions import StringSession
 
 
-# ------------------ تنظیمات محیطی (برای خود ربات Bot) ------------------
+# ------------------ تنظیمات محیطی ------------------
 
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# آیدی عددی ادمین اصلی (ثابت طبق چیزی که دادی)
+OWNER_ID = 6474515118
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("API_ID / API_HASH / BOT_TOKEN باید تو Environment Variable ست بشن.")
 
-BOT_SESSION = "bot_session"
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL برای اتصال به Postgres ست نشده.")
 
+BOT_SESSION = "bot_session"
 client = TelegramClient(BOT_SESSION, API_ID, API_HASH)
 
-# ------------------ فایل‌های داده ------------------
 
-ADMINS_FILE = "admins.json"
-SETTINGS_FILE = "settings.json"
-ACCOUNTS_FILE = "accounts.json"
+# ------------------ متغیرهای درون حافظه ------------------
 
-ADMINS = set()         # ادمین‌ها (آی‌دی عددی)
-INVITE_DELAY = 60      # تاخیر بین هر اد (ثانیه)
+ADMINS = set()
+INVITE_DELAY = 60  # ثانیه
 
-ACCOUNTS = []          # اکانت‌ها برای add user
-ACTIVE_ACCOUNT = None  # نام اکانت فعال برای add user
+# فقط اکانت‌های نوع add را در حافظه نگه می‌داریم
+ACCOUNTS_ADD = []  # list of dicts: {id, name, phone, api_id, api_hash, session_string}
+ACTIVE_ADD_ACCOUNT = None
 
-account_clients = {}   # name -> TelegramClient (اکانت‌ها برای add user)
+user_states = {}           # user_id -> {mode, step, temp}
+login_clients_add = {}     # user_id -> TelegramClient موقت هنگام لاگین add
+login_clients_export = {}  # user_id -> TelegramClient موقت هنگام لاگین export
 
-user_states = {}       # user_id -> {"mode": ..., "step": ..., "temp": {...}}
-
-# برای ویزارد جدید export (شماره → کد → chat_id)
-export_clients = {}    # user_id -> {"client": TelegramClient, "phone": str, "phone_code_hash": str | None}
-
-# وضعیت گروه‌ها برای add user
-groups_cache = []              # لیست گروه‌ها برای add user
-target_group = None            # گروه انتخاب‌شده برای add user
-awaiting_group_number = False  # آیا منتظر عدد گروه هستیم یا نه
+groups_cache = []
+target_group = None
+awaiting_group_number = False
 
 
-# ------------------ load/save ها ------------------
+# ------------------ توابع دیتابیس (PostgreSQL) ------------------
 
-def load_admins():
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    """ایجاد جداول و لود تنظیمات/ادمین/اکانت‌ها"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # جدول ادمین‌ها
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id BIGINT PRIMARY KEY
+        )
+    """)
+
+    # تنظیمات کلی
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # اکانت‌ها (add + export)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT,
+            api_id BIGINT NOT NULL,
+            api_hash TEXT NOT NULL,
+            session_string TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('add', 'export')),
+            UNIQUE(name, kind)
+        )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    load_admins_from_db()
+    load_settings_from_db()
+    load_accounts_add_from_db()
+
+
+def load_admins_from_db():
     global ADMINS
-    try:
-        with open(ADMINS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            ADMINS = set(data.get("admins", []))
-    except FileNotFoundError:
-        ADMINS = set()
-    except Exception:
-        ADMINS = set()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT user_id FROM admins")
+    rows = cur.fetchall()
+    ADMINS = {row["user_id"] for row in rows}
+
+    # حتماً OWNER_ID همیشه ادمین باشد
+    if OWNER_ID not in ADMINS:
+        cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (OWNER_ID,))
+        conn.commit()
+        ADMINS.add(OWNER_ID)
+
+    cur.close()
+    conn.close()
 
 
-def save_admins():
-    try:
-        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"admins": list(ADMINS)}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        traceback.print_exc()
+def add_admin_db(user_id: int):
+    global ADMINS
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    ADMINS.add(user_id)
 
 
-def load_settings():
-    global INVITE_DELAY
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            INVITE_DELAY = int(data.get("invite_delay", 60))
-    except FileNotFoundError:
+def remove_admin_db(user_id: int):
+    global ADMINS
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    if user_id in ADMINS:
+        ADMINS.remove(user_id)
+
+
+def load_settings_from_db():
+    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("SELECT value FROM settings WHERE key = 'invite_delay'")
+    row = cur.fetchone()
+    if row:
+        try:
+            INVITE_DELAY = int(row["value"])
+        except ValueError:
+            INVITE_DELAY = 60
+    else:
         INVITE_DELAY = 60
-    except Exception:
-        INVITE_DELAY = 60
+
+    cur.execute("SELECT value FROM settings WHERE key = 'active_add_account'")
+    row = cur.fetchone()
+    if row:
+        ACTIVE_ADD_ACCOUNT = row["value"]
+    else:
+        ACTIVE_ADD_ACCOUNT = None
+
+    cur.close()
+    conn.close()
 
 
-def save_settings():
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"invite_delay": INVITE_DELAY}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        traceback.print_exc()
+def set_setting(key: str, value: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO settings(key, value)
+        VALUES (%s, %s)
+        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        (key, value),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def load_accounts():
-    global ACCOUNTS, ACTIVE_ACCOUNT
-    try:
-        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            ACCOUNTS = data.get("accounts", [])
-            ACTIVE_ACCOUNT = data.get("active", None)
-    except FileNotFoundError:
-        ACCOUNTS = []
-        ACTIVE_ACCOUNT = None
-    except Exception:
-        ACCOUNTS = []
-        ACTIVE_ACCOUNT = None
+def load_accounts_add_from_db():
+    """فقط اکانت‌های نوع add را در حافظه می‌آورد"""
+    global ACCOUNTS_ADD
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM accounts WHERE kind = 'add'")
+    rows = cur.fetchall()
+    ACCOUNTS_ADD = []
+    for r in rows:
+        ACCOUNTS_ADD.append({
+            "id": r["id"],
+            "name": r["name"],
+            "phone": r["phone"],
+            "api_id": r["api_id"],
+            "api_hash": r["api_hash"],
+            "session_string": r["session_string"],
+        })
+    cur.close()
+    conn.close()
 
 
-def save_accounts():
-    data = {
-        "active": ACTIVE_ACCOUNT,
-        "accounts": ACCOUNTS,
-    }
-    try:
-        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        traceback.print_exc()
+def insert_account(name, phone, api_id, api_hash, session_string, kind):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO accounts(name, phone, api_id, api_hash, session_string, kind)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (name, phone, api_id, api_hash, session_string, kind),
+    )
+    acc_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return acc_id
 
 
-# ------------------ ادمین و اکانت برای add user ------------------
+def delete_account_by_id(acc_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM accounts WHERE id = %s", (acc_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_export_accounts():
+    """لیست همه اکانت‌های export از دیتابیس"""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, name, phone FROM accounts WHERE kind = 'export'")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    accounts = []
+    for r in rows:
+        accounts.append({
+            "id": r["id"],
+            "name": r["name"],
+            "phone": r["phone"] or ""
+        })
+    return accounts
+
+
+def get_account_row_by_id(acc_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM accounts WHERE id = %s", (acc_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def export_account_name_exists(name: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM accounts WHERE kind = 'export' AND name = %s", (name,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row is not None
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
 
-def get_account_by_name(name: str):
-    for acc in ACCOUNTS:
+def get_add_account_by_name(name: str):
+    for acc in ACCOUNTS_ADD:
         if acc["name"] == name:
             return acc
     return None
 
 
-def list_accounts_text() -> str:
-    if not ACCOUNTS:
-        return "هیچ اکانتی ثبت نشده."
-    lines = ["اکانت‌های ثبت‌شده:\n"]
-    for acc in ACCOUNTS:
-        mark = "(active)" if acc["name"] == ACTIVE_ACCOUNT else ""
-        lines.append(f"* {acc['name']} {mark}\n  phone: {acc['phone']}")
-    return "\n".join(lines)
-
-
-async def get_account_client(name: str) -> TelegramClient:
-    """client مربوط به یک اکانت (برای add user)"""
-    acc = get_account_by_name(name)
-    if not acc:
-        raise RuntimeError("اکانت پیدا نشد.")
-
-    if name in account_clients:
-        c = account_clients[name]
-    else:
-        c = TelegramClient(acc["session_name"], acc["api_id"], acc["api_hash"])
-        account_clients[name] = c
-
-    if not c.is_connected():
-        await c.connect()
-    return c
-
-
-def set_active_account(name: str):
-    global ACTIVE_ACCOUNT
-    ACTIVE_ACCOUNT = name
-    save_accounts()
-
-
-# ------------------ منوی اصلی ------------------
+# ------------------ منو ------------------
 
 def main_menu():
     return [
@@ -181,6 +299,10 @@ def main_menu():
         ],
         [
             Button.text("⏱ تنظیم تاخیر"),
+            Button.text("🗑 حذف اکانت add"),
+        ],
+        [
+            Button.text("🚪 خروج اکانت‌های export"),
         ],
     ]
 
@@ -189,15 +311,28 @@ async def send_main_menu(chat_id, text="از منوی زیر استفاده کن
     await client.send_message(chat_id, text, buttons=main_menu())
 
 
-# ------------------ گروه‌ها برای add user ------------------
+# ------------------ کمک برای add user ------------------
+
+async def get_add_account_client():
+    """کلاینت اکانت فعال برای add user (از روی StringSession در دیتابیس)"""
+    if not ACTIVE_ADD_ACCOUNT:
+        raise RuntimeError("هیچ اکانت فعالی برای add user تنظیم نشده است.")
+    acc = get_add_account_by_name(ACTIVE_ADD_ACCOUNT)
+    if not acc:
+        raise RuntimeError("اکانت فعال در دیتابیس پیدا نشد.")
+
+    session = StringSession(acc["session_string"])
+    user_client = TelegramClient(session, acc["api_id"], acc["api_hash"])
+    await user_client.connect()
+    if not await user_client.is_user_authorized():
+        raise RuntimeError("این اکانت دیگر لاگین نیست (سشن منقضی شده). دوباره اکانت را اضافه کن.")
+    return user_client
+
 
 async def fetch_groups_for_active():
     """لیست گروه‌های اکانت فعال برای add user"""
     global groups_cache
-    if not ACTIVE_ACCOUNT:
-        raise RuntimeError("هیچ اکانت فعالی انتخاب نشده.")
-    user_client = await get_account_client(ACTIVE_ACCOUNT)
-
+    user_client = await get_add_account_client()
     result = await user_client(GetDialogsRequest(
         offset_date=None,
         offset_id=0,
@@ -206,13 +341,14 @@ async def fetch_groups_for_active():
         hash=0
     ))
     groups_cache = [c for c in result.chats if getattr(c, "megagroup", False)]
+    await user_client.disconnect()
     return groups_cache
 
 
 def groups_text():
     if not groups_cache:
         return "هیچ سوپرگروهی یافت نشد (یا این اکانت در سوپرگروهی نیست)."
-    lines = [f"اکانت فعال برای add user: {ACTIVE_ACCOUNT}\n", "لیست سوپرگروه‌ها:"]
+    lines = [f"اکانت فعال برای add user: {ACTIVE_ADD_ACCOUNT}\n", "لیست سوپرگروه‌ها:"]
     for i, g in enumerate(groups_cache):
         lines.append(f"{i}: {g.title}")
     lines.append("\nیک عدد بفرست تا همان گروه برای add user انتخاب شود.")
@@ -227,14 +363,18 @@ def sanitize_filename(title: str) -> str:
 async def add_users_from_csv_file(file_path, chat_id):
     """add user از CSV با استفاده از اکانت فعال و گروه انتخاب‌شده"""
     global target_group
-    if not ACTIVE_ACCOUNT:
+    if not ACTIVE_ADD_ACCOUNT:
         await client.send_message(chat_id, "هیچ اکانتی برای add user فعال نیست. اول اکانت را تنظیم کن.")
         return
     if target_group is None:
         await client.send_message(chat_id, "هیچ گروهی برای add user انتخاب نشده. از دکمه 🧾 گروه‌ها استفاده کن.")
         return
 
-    user_client = await get_account_client(ACTIVE_ACCOUNT)
+    try:
+        user_client = await get_add_account_client()
+    except Exception as e:
+        await client.send_message(chat_id, f"خطا در گرفتن کلاینت اکانت add:\n{e}")
+        return
 
     users = []
     try:
@@ -281,13 +421,16 @@ async def add_users_from_csv_file(file_path, chat_id):
             await client.send_message(chat_id, f"⚠️ خطا برای {username_or_id}:\n{e}")
             traceback.print_exc()
 
+    await user_client.disconnect()
     await client.send_message(chat_id, "پروسه اد کردن کاربران تمام شد.")
 
 
-# ------------------ state handler برای ویزاردها ------------------
+# ------------------ state handler ------------------
 
 async def handle_state_message(event, state):
-    """پیام‌هایی که وسط ویزاردها (addacc / setdelay / export) هستیم"""
+    """هدل کردن ویزاردها"""
+    global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD
+
     user_id = event.sender_id
     chat_id = event.chat_id
     text = (event.raw_text or "").strip()
@@ -295,18 +438,18 @@ async def handle_state_message(event, state):
     step = state.get("step")
     temp = state.get("temp", {})
 
-    # ---------- ویزارد افزودن اکانت برای add user ----------
+    # ---------- افزودن اکانت add با لاگین کد ----------
     if mode == "addacc":
         if step == "name":
             name = text
-            if get_account_by_name(name):
-                await event.reply("این نام قبلاً وجود دارد، یک نام دیگر بفرست.")
+            if get_add_account_by_name(name):
+                await event.reply("این نام قبلاً برای اکانت add استفاده شده، یک نام دیگر بفرست.")
                 return
             temp["name"] = name
             state["step"] = "api_id"
             state["temp"] = temp
             user_states[user_id] = state
-            await event.reply("حالا API_ID را بفرست (عدد):")
+            await event.reply("API_ID را بفرست (عدد):")
             return
 
         if step == "api_id":
@@ -317,7 +460,7 @@ async def handle_state_message(event, state):
             state["step"] = "api_hash"
             state["temp"] = temp
             user_states[user_id] = state
-            await event.reply("حالا API_HASH را بفرست:")
+            await event.reply("API_HASH را بفرست:")
             return
 
         if step == "api_hash":
@@ -334,34 +477,222 @@ async def handle_state_message(event, state):
             name = temp["name"]
             api_id = temp["api_id"]
             api_hash = temp["api_hash"]
-            session_name = f"session_{name}"
 
-            ACCOUNTS.append({
-                "name": name,
-                "phone": phone,
-                "api_id": api_id,
-                "api_hash": api_hash,
-                "session_name": session_name
-            })
-            save_accounts()
-
+            acc_client = TelegramClient(StringSession(), api_id, api_hash)
+            await acc_client.connect()
             try:
-                user_client = await get_account_client(name)
-                sent = await user_client.send_code_request(phone)
+                sent = await acc_client.send_code_request(phone)
                 temp["phone_code_hash"] = sent.phone_code_hash
+                login_clients_add[user_id] = acc_client
                 state["step"] = "code"
                 state["temp"] = temp
                 user_states[user_id] = state
                 await event.reply(
-                    f"کد به شماره {phone} ارسال شد.\nکد را همینجا بفرست (فقط عدد):"
+                    f"کد به شماره {phone} ارسال شد.\n"
+                    "کد را همینجا بفرست (فقط عدد):"
                 )
             except Exception as e:
                 await event.reply(f"خطا در ارسال کد:\n{e}")
                 traceback.print_exc()
-                acc = get_account_by_name(name)
-                if acc:
-                    ACCOUNTS.remove(acc)
-                    save_accounts()
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+                user_states.pop(user_id, None)
+            return
+
+        if step == "code":
+            code = text
+            phone = temp["phone"]
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
+            name = temp["name"]
+            phone_code_hash = temp.get("phone_code_hash")
+
+            acc_client = login_clients_add.get(user_id)
+            if not acc_client:
+                await event.reply("سشن لاگین پیدا نشد. دوباره ➕ افزودن اکانت را بزن.")
+                user_states.pop(user_id, None)
+                return
+
+            try:
+                await acc_client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=phone_code_hash
+                )
+                session_string = acc_client.session.save()
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+
+                acc_id = insert_account(
+                    name=name,
+                    phone=phone,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_string=session_string,
+                    kind="add"
+                )
+
+                ACCOUNTS_ADD.append({
+                    "id": acc_id,
+                    "name": name,
+                    "phone": phone,
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "session_string": session_string,
+                })
+
+                if not ACTIVE_ADD_ACCOUNT:
+                    ACTIVE_ADD_ACCOUNT = name
+                    set_setting("active_add_account", name)
+
+                user_states.pop(user_id, None)
+                await event.reply(f"✅ اکانت `{name}` برای add user ثبت و لاگین شد.", parse_mode="markdown")
+                await send_main_menu(chat_id)
+
+            except PhoneCodeExpiredError:
+                await event.reply("کد منقضی شده. دوباره دکمه «➕ افزودن اکانت» را بزن و از اول شروع کن.")
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+                user_states.pop(user_id, None)
+            except SessionPasswordNeededError:
+                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+                user_states.pop(user_id, None)
+            except Exception as e:
+                await event.reply(f"خطا در لاگین:\n{e}")
+                traceback.print_exc()
+                await acc_client.disconnect()
+                login_clients_add.pop(user_id, None)
+                user_states.pop(user_id, None)
+            return
+
+    # ---------- تنظیم تاخیر ----------
+    if mode == "setdelay":
+        if not text.isdigit():
+            await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
+            return
+        INVITE_DELAY = int(text)
+        if INVITE_DELAY < 1:
+            INVITE_DELAY = 1
+        set_setting("invite_delay", str(INVITE_DELAY))
+        user_states.pop(user_id, None)
+        await event.reply(f"✅ تاخیر بین ادها روی {INVITE_DELAY} ثانیه تنظیم شد.")
+        await send_main_menu(chat_id)
+        return
+
+    # ---------- حذف اکانت add ----------
+    if mode == "delacc_wizard":
+        if step == "choose":
+            if not text.isdigit():
+                await event.reply("فقط شماره اکانت را بفرست (مثلاً 0 یا 1).")
+                return
+            idx = int(text)
+            names = temp.get("names", [])
+            if idx < 0 or idx >= len(names):
+                await event.reply("شماره نامعتبر است. دوباره سعی کن.")
+                return
+            acc_info = names[idx]
+            acc_id = acc_info["id"]
+            name = acc_info["name"]
+
+            delete_account_by_id(acc_id)
+            ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
+
+            if ACTIVE_ADD_ACCOUNT == name:
+                ACTIVE_ADD_ACCOUNT = None
+                set_setting("active_add_account", "")
+
+            user_states.pop(user_id, None)
+            await event.reply(f"✅ اکانت {name} حذف شد.")
+            await send_main_menu(chat_id)
+            return
+
+    # ---------- انتخاب اکانت export برای خروج اعضا ----------
+    if mode == "export_select":
+        if step == "choose":
+            accounts = temp.get("accounts", [])
+            lower = text.lower()
+            if lower == "new":
+                user_states[user_id] = {
+                    "mode": "export_login",
+                    "step": "name",
+                    "temp": {},
+                }
+                await event.reply("اسم دلخواه برای این اکانت export را بفرست (مثلاً exp1):")
+                return
+
+            if not text.isdigit():
+                await event.reply('یک عدد برای انتخاب اکانت یا عبارت "new" برای ساخت اکانت جدید بفرست.')
+                return
+            idx = int(text)
+            if idx < 0 or idx >= len(accounts):
+                await event.reply("شماره نامعتبر است. دوباره سعی کن.")
+                return
+
+            acc_id = accounts[idx]["id"]
+            temp2 = {"account_id": acc_id}
+            user_states[user_id] = {"mode": "export_chat", "step": "chat_id", "temp": temp2}
+            await event.reply("حالا chat_id گروه را بفرست (مثلاً -1001234567890):")
+            return
+
+    # ---------- ویزارد لاگین اکانت export با کد ----------
+    if mode == "export_login":
+        if step == "name":
+            name = text
+            if export_account_name_exists(name):
+                await event.reply("این نام قبلاً برای اکانت export استفاده شده، یک نام دیگر بفرست.")
+                return
+            temp["name"] = name
+            state["step"] = "api_id"
+            state["temp"] = temp
+            user_states[user_id] = state
+            await event.reply("API_ID را بفرست (عدد):")
+            return
+
+        if step == "api_id":
+            if not text.isdigit():
+                await event.reply("API_ID باید عدد باشد. دوباره بفرست:")
+                return
+            temp["api_id"] = int(text)
+            state["step"] = "api_hash"
+            state["temp"] = temp
+            user_states[user_id] = state
+            await event.reply("API_HASH را بفرست:")
+            return
+
+        if step == "api_hash":
+            temp["api_hash"] = text
+            state["step"] = "phone"
+            state["temp"] = temp
+            user_states[user_id] = state
+            await event.reply("شماره تلفن اکانت export را با فرمت +98912... بفرست:")
+            return
+
+        if step == "phone":
+            phone = text
+            temp["phone"] = phone
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
+
+            exp_client = TelegramClient(StringSession(), api_id, api_hash)
+            await exp_client.connect()
+            try:
+                sent = await exp_client.send_code_request(phone)
+                temp["phone_code_hash"] = sent.phone_code_hash
+                login_clients_export[user_id] = exp_client
+                state["step"] = "code"
+                state["temp"] = temp
+                user_states[user_id] = state
+                await event.reply(
+                    f"کد به شماره {phone} ارسال شد.\n"
+                    "کد را همینجا بفرست (فقط عدد):"
+                )
+            except Exception as e:
+                await event.reply(f"خطا در ارسال کد:\n{e}")
+                traceback.print_exc()
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
                 user_states.pop(user_id, None)
             return
 
@@ -369,135 +700,91 @@ async def handle_state_message(event, state):
             code = text
             name = temp["name"]
             phone = temp["phone"]
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
             phone_code_hash = temp.get("phone_code_hash")
-            try:
-                user_client = await get_account_client(name)
-                await user_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-                await event.reply(f"✅ اکانت {name} برای add user لاگین شد.")
 
-                global ACTIVE_ACCOUNT
-                if not ACTIVE_ACCOUNT:
-                    ACTIVE_ACCOUNT = name
-                save_accounts()
-
-                user_states.pop(user_id, None)
-                await send_main_menu(chat_id, "اکانت اضافه شد. از منو ادامه بده:")
-            except PhoneCodeExpiredError:
-                acc = get_account_by_name(name)
-                if acc:
-                    ACCOUNTS.remove(acc)
-                    save_accounts()
-                user_states.pop(user_id, None)
-                await event.reply("کد منقضی شده. دوباره دکمه «➕ افزودن اکانت» را بزن و از اول شروع کن.")
-            except SessionPasswordNeededError:
-                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
-            except Exception as e:
-                await event.reply(f"خطا در لاگین:\n{e}")
-                traceback.print_exc()
-            return
-
-    # ---------- ویزارد تنظیم تاخیر ----------
-    if mode == "setdelay":
-        if not text.isdigit():
-            await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
-            return
-        global INVITE_DELAY
-        INVITE_DELAY = int(text)
-        if INVITE_DELAY < 1:
-            INVITE_DELAY = 1
-        save_settings()
-        user_states.pop(user_id, None)
-        await event.reply(f"✅ تاخیر بین ادها روی {INVITE_DELAY} ثانیه تنظیم شد.")
-        await send_main_menu(chat_id)
-        return
-
-    # ---------- ویزارد جدید export (شماره → کد → chat_id) ----------
-    if mode == "export":
-        # مرحله ۱: phone
-        if step == "phone":
-            phone = text
-            temp["phone"] = phone
-            state["temp"] = temp
-            user_states[user_id] = state
-
-            session_name = "export_" + re.sub(r"[^0-9]+", "", phone)
-            uclient = TelegramClient(session_name, API_ID, API_HASH)
-            export_clients[user_id] = {"client": uclient, "phone": phone, "phone_code_hash": None}
-
-            try:
-                await uclient.connect()
-                if await uclient.is_user_authorized():
-                    state["step"] = "chat_id"
-                    user_states[user_id] = state
-                    await event.reply(
-                        "قبلاً با این شماره لاگین شده‌ای.\n"
-                        "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
-                    )
-                else:
-                    sent = await uclient.send_code_request(phone)
-                    export_clients[user_id]["phone_code_hash"] = sent.phone_code_hash
-                    state["step"] = "code"
-                    user_states[user_id] = state
-                    await event.reply("کد ارسال‌شده به تلگرام را بفرست (فقط عدد):")
-            except Exception as e:
-                await event.reply(f"خطا در اتصال/ارسال کد:\n{e}")
-                traceback.print_exc()
-                info = export_clients.pop(user_id, None)
-                if info:
-                    try:
-                        await info["client"].disconnect()
-                    except Exception:
-                        pass
-                user_states.pop(user_id, None)
-            return
-
-        # مرحله ۲: code
-        if step == "code":
-            info = export_clients.get(user_id)
-            if not info:
-                await event.reply("خطا: سشن export پیدا نشد. دوباره دکمه 📤 خروج اعضا را بزن.")
+            exp_client = login_clients_export.get(user_id)
+            if not exp_client:
+                await event.reply("سشن لاگین export پیدا نشد. دوباره 📤 خروج اعضا را بزن.")
                 user_states.pop(user_id, None)
                 return
-            uclient = info["client"]
-            phone = info["phone"]
-            phone_code_hash = info.get("phone_code_hash")
-            code = text
+
             try:
-                await uclient.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-                state["step"] = "chat_id"
-                user_states[user_id] = state
+                await exp_client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=phone_code_hash
+                )
+                session_string = exp_client.session.save()
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
+
+                acc_id = insert_account(
+                    name=name,
+                    phone=phone,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_string=session_string,
+                    kind="export"
+                )
+
+                temp2 = {"account_id": acc_id}
+                user_states[user_id] = {"mode": "export_chat", "step": "chat_id", "temp": temp2}
                 await event.reply(
-                    "✅ لاگین شدی.\n"
-                    "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
+                    f"✅ اکانت export `{name}` لاگین شد.\n"
+                    "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست:",
+                    parse_mode="markdown"
                 )
             except PhoneCodeExpiredError:
-                info = export_clients.pop(user_id, None)
-                if info:
-                    try:
-                        await info["client"].disconnect()
-                    except Exception:
-                        pass
-                user_states.pop(user_id, None)
                 await event.reply("کد منقضی شده. دوباره دکمه 📤 خروج اعضا را بزن و از اول شروع کن.")
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
+                user_states.pop(user_id, None)
             except SessionPasswordNeededError:
-                await event.reply("برای این شماره رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
+                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
+                user_states.pop(user_id, None)
             except Exception as e:
                 await event.reply(f"خطا در لاگین:\n{e}")
                 traceback.print_exc()
+                await exp_client.disconnect()
+                login_clients_export.pop(user_id, None)
+                user_states.pop(user_id, None)
             return
 
-        # مرحله ۳: chat_id
+    # ---------- گرفتن اعضای گروه با اکانت export ----------
+    if mode == "export_chat":
         if step == "chat_id":
-            info = export_clients.get(user_id)
-            if not info:
-                await event.reply("خطا: سشن export پیدا نشد. دوباره دکمه 📤 خروج اعضا را بزن.")
-                user_states.pop(user_id, None)
-                return
-            uclient = info["client"]
             try:
                 chat_id_val = int(text)
-                entity = await uclient.get_entity(chat_id_val)
-                participants = await uclient.get_participants(entity, aggressive=True)
+            except ValueError:
+                await event.reply("chat_id باید عدد باشد. مثلاً -1001234567890")
+                return
+
+            acc_id = temp.get("account_id")
+            row = get_account_row_by_id(acc_id)
+            if not row:
+                await event.reply("اکانت export در دیتابیس یافت نشد.")
+                user_states.pop(user_id, None)
+                return
+
+            session_string = row["session_string"]
+            api_id = row["api_id"]
+            api_hash = row["api_hash"]
+
+            exp_client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            try:
+                await exp_client.connect()
+                if not await exp_client.is_user_authorized():
+                    await event.reply("این اکانت export دیگر لاگین نیست. مجدداً آن را بساز.")
+                    await exp_client.disconnect()
+                    user_states.pop(user_id, None)
+                    return
+
+                entity = await exp_client.get_entity(chat_id_val)
+                participants = await exp_client.get_participants(entity, aggressive=True)
 
                 buffer = io.StringIO()
                 writer = csv.writer(buffer, delimiter=",", lineterminator="\n")
@@ -525,43 +812,82 @@ async def handle_state_message(event, state):
                     caption=f"تعداد اعضا: {len(participants)}"
                 )
 
-                await uclient.disconnect()
-                export_clients.pop(user_id, None)
+                await exp_client.disconnect()
                 user_states.pop(user_id, None)
                 await send_main_menu(chat_id, "خروج اعضا انجام شد. از منو ادامه بده:")
+
             except Exception as e:
                 await event.reply(f"خطا در گرفتن اعضای گروه:\n{e}")
                 traceback.print_exc()
             return
 
+    # ---------- logout اکانت‌های export ----------
+    if mode == "logout_export":
+        if step == "choose":
+            accounts = temp.get("accounts", [])
+            if not text.isdigit():
+                await event.reply("فقط شماره اکانت را بفرست (مثلاً 0 یا 1).")
+                return
+            idx = int(text)
+            if idx < 0 or idx >= len(accounts):
+                await event.reply("شماره نامعتبر است. دوباره سعی کن.")
+                return
 
-# ------------------ هندل اصلی پیام‌ها ------------------
+            acc = accounts[idx]
+            acc_id = acc["id"]
+            row = get_account_row_by_id(acc_id)
+            if not row:
+                await event.reply("این اکانت export دیگر در دیتابیس نیست.")
+                user_states.pop(user_id, None)
+                return
+
+            session_string = row["session_string"]
+            api_id = row["api_id"]
+            api_hash = row["api_hash"]
+
+            exp_client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            try:
+                await exp_client.connect()
+                if await exp_client.is_user_authorized():
+                    await exp_client.log_out()
+                await exp_client.disconnect()
+            except Exception as e:
+                await event.reply(f"در حین logout این اکانت خطایی رخ داد (ولی ادامه می‌دهیم):\n{e}")
+
+            delete_account_by_id(acc_id)
+
+            user_states.pop(user_id, None)
+            await event.reply(
+                f"✅ از اکانت export `{acc['name']}` خارج شدی و از دیتابیس حذف شد.",
+                parse_mode="markdown",
+            )
+            await send_main_menu(chat_id)
+            return
+
+
+# ------------------ main handler ------------------
 
 @client.on(events.NewMessage)
 async def main_handler(event):
-    global awaiting_group_number, target_group
+    global awaiting_group_number, target_group, ACTIVE_ADD_ACCOUNT, INVITE_DELAY, ACCOUNTS_ADD
 
     user_id = event.sender_id
     chat_id = event.chat_id
     text = (event.raw_text or "").strip()
 
-    # /me -> آی‌دی عددی
+    # /me
     if text == "/me":
         await event.reply(f"آی‌دی عددی شما: `{user_id}`", parse_mode="markdown")
         return
 
     # /setmeadmin
     if text == "/setmeadmin":
-        if not ADMINS:
-            ADMINS.add(user_id)
-            save_admins()
-            await event.reply("✅ شما به عنوان ادمین اصلی ثبت شدید.")
-            await send_main_menu(chat_id)
-        else:
-            if is_admin(user_id):
-                await event.reply("شما قبلاً ادمین هستید.")
-            else:
-                await event.reply("ادمین قبلاً تعریف شده. فقط ادمین‌ها می‌توانند ادمین جدید اضافه کنند.")
+        if ADMINS and user_id not in ADMINS:
+            await event.reply("ادمین قبلاً تعریف شده. فقط ادمین‌ها می‌توانند ادمین جدید اضافه کنند.")
+            return
+        add_admin_db(user_id)
+        await event.reply("✅ شما به عنوان ادمین ثبت شدید.")
+        await send_main_menu(chat_id)
         return
 
     # /start
@@ -571,9 +897,9 @@ async def main_handler(event):
                 "سلام ادمین 👋\n"
                 "از دکمه‌های زیر برای مدیریت استفاده کن.\n\n"
                 "دستورات تکمیلی:\n"
-                "/accounts  → لیست اکانت‌ها (برای add user)\n"
+                "/accounts  → لیست اکانت‌های add\n"
                 "/useacc <name> → انتخاب اکانت فعال برای add user\n"
-                "/delacc <name> → حذف اکانت\n"
+                "/delacc <name> → حذف اکانت add\n"
                 "/admins → لیست ادمین‌ها\n"
                 "/addadmin <id> /deladmin <id>\n"
                 "/setdelay <sec> → تاخیر اد از CSV",
@@ -582,15 +908,13 @@ async def main_handler(event):
         else:
             await event.reply(
                 "سلام 👋\n"
-                "برای ادمین شدن (اگر هنوز ادمینی ثبت نشده) از دستور زیر استفاده کن:\n"
-                "`/setmeadmin`\n"
-                "برای دیدن آی‌دی عددی خودت:\n"
-                "`/me`",
+                "برای دیدن آی‌دی عددی خودت:\n`/me`\n\n"
+                "اگر اولین بار استارت می‌کنی و ادمینی تعریف نشده:\n`/setmeadmin` را بزن.",
                 parse_mode="markdown"
             )
         return
 
-    # اگر ادمین نیستی، کاری نکن
+    # اگر ادمین نیست، ادامه نده
     if not is_admin(user_id):
         return
 
@@ -608,8 +932,9 @@ async def main_handler(event):
                 traceback.print_exc()
         return
 
-    # ---------- مدیریت ادمین‌ها ----------
+    # ------------ دستورات ادمین ------------
 
+    # لیست ادمین‌ها
     if text == "/admins":
         if not ADMINS:
             await event.reply("هیچ ادمینی ثبت نشده.")
@@ -618,17 +943,18 @@ async def main_handler(event):
             await event.reply(f"لیست ادمین‌ها (آی‌دی عددی):\n{ids_text}")
         return
 
+    # اضافه کردن ادمین
     if text.startswith("/addadmin"):
         parts = text.split()
         if len(parts) != 2 or not parts[1].isdigit():
             await event.reply("فرمت درست: `/addadmin <user_id>`", parse_mode="markdown")
             return
         new_id = int(parts[1])
-        ADMINS.add(new_id)
-        save_admins()
+        add_admin_db(new_id)
         await event.reply(f"✅ ادمین جدید اضافه شد: `{new_id}`", parse_mode="markdown")
         return
 
+    # حذف ادمین
     if text.startswith("/deladmin"):
         parts = text.split()
         if len(parts) != 2 or not parts[1].isdigit():
@@ -636,23 +962,20 @@ async def main_handler(event):
             return
         rem_id = int(parts[1])
         if rem_id in ADMINS:
-            ADMINS.remove(rem_id)
-            save_admins()
+            remove_admin_db(rem_id)
             await event.reply(f"✅ ادمین حذف شد: `{rem_id}`", parse_mode="markdown")
         else:
             await event.reply("این آی‌دی جزو ادمین‌ها نیست.")
         return
 
-    # ---------- مدیریت delay ----------
-
+    # تنظیم تاخیر با دستور
     if text.startswith("/setdelay"):
         parts = text.split()
         if len(parts) == 2 and parts[1].isdigit():
-            global INVITE_DELAY
             INVITE_DELAY = int(parts[1])
             if INVITE_DELAY < 1:
                 INVITE_DELAY = 1
-            save_settings()
+            set_setting("invite_delay", str(INVITE_DELAY))
             await event.reply(f"✅ تاخیر بین ادها روی {INVITE_DELAY} ثانیه تنظیم شد.")
         else:
             await event.reply("فرمت درست: `/setdelay <seconds>`", parse_mode="markdown")
@@ -663,10 +986,17 @@ async def main_handler(event):
         await event.reply("عدد تاخیر بین ادها (ثانیه) را بفرست:")
         return
 
-    # ---------- مدیریت اکانت‌ها برای add user ----------
+    # ----------- مدیریت اکانت‌های add -----------
 
     if text == "/accounts" or text == "📜 اکانت‌ها":
-        await event.reply(list_accounts_text())
+        if not ACCOUNTS_ADD:
+            await event.reply("هیچ اکانتی برای add user ثبت نشده.")
+        else:
+            lines = ["اکانت‌های add:\n"]
+            for acc in ACCOUNTS_ADD:
+                mark = "(active)" if acc["name"] == ACTIVE_ADD_ACCOUNT else ""
+                lines.append(f"- {acc['name']} {mark}  phone: {acc['phone']}")
+            await event.reply("\n".join(lines))
         return
 
     if text.startswith("/useacc"):
@@ -675,10 +1005,12 @@ async def main_handler(event):
             await event.reply("فرمت درست: `/useacc <name>`", parse_mode="markdown")
             return
         name = parts[1].strip()
-        if not get_account_by_name(name):
+        acc = get_add_account_by_name(name)
+        if not acc:
             await event.reply("اکانت با این نام وجود ندارد.")
             return
-        set_active_account(name)
+        ACTIVE_ADD_ACCOUNT = name
+        set_setting("active_add_account", name)
         await event.reply(f"✅ اکانت فعال برای add user تنظیم شد: {name}")
         return
 
@@ -688,27 +1020,44 @@ async def main_handler(event):
             await event.reply("فرمت درست: `/delacc <name>`", parse_mode="markdown")
             return
         name = parts[1].strip()
-        acc = get_account_by_name(name)
+        acc = get_add_account_by_name(name)
         if not acc:
             await event.reply("اکانت با این نام وجود ندارد.")
             return
-        ACCOUNTS.remove(acc)
-        global ACTIVE_ACCOUNT
-        if ACTIVE_ACCOUNT == name:
-            ACTIVE_ACCOUNT = None
-        save_accounts()
+        acc_id = acc["id"]
+        delete_account_by_id(acc_id)
+        ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
+        if ACTIVE_ADD_ACCOUNT == name:
+            ACTIVE_ADD_ACCOUNT = None
+            set_setting("active_add_account", "")
         await event.reply(f"✅ اکانت حذف شد: {name}")
         return
 
     if text == "➕ افزودن اکانت":
         user_states[user_id] = {"mode": "addacc", "step": "name", "temp": {}}
-        await event.reply("اسم دلخواه برای این اکانت را بفرست (مثلاً main یا acc1):")
+        await event.reply("اسم دلخواه برای این اکانت add را بفرست (مثلاً main یا acc1):")
         return
 
-    # ---------- مدیریت گروه‌ها برای add user ----------
+    if text == "🗑 حذف اکانت add":
+        if not ACCOUNTS_ADD:
+            await event.reply("هیچ اکانتی برای حذف وجود ندارد.")
+            return
+        names = [{"id": a["id"], "name": a["name"]} for a in ACCOUNTS_ADD]
+        temp = {"names": names}
+        user_states[user_id] = {"mode": "delacc_wizard", "step": "choose", "temp": temp}
+
+        lines = ["اکانت‌های add ثبت‌شده:"]
+        for i, a in enumerate(names):
+            lines.append(f"{i}: {a['name']}")
+        lines.append("\nشماره اکانتی که می‌خوای حذف کنی رو بفرست:")
+
+        await event.reply("\n".join(lines))
+        return
+
+    # ----------- مدیریت گروه‌ها برای add -----------
 
     if text == "🧾 گروه‌ها" or text == "/groups":
-        if not ACTIVE_ACCOUNT:
+        if not ACTIVE_ADD_ACCOUNT:
             await event.reply("هیچ اکانتی برای add user فعال نیست. از منو اکانت اضافه کن یا /useacc بزن.")
             return
         await event.reply("در حال گرفتن لیست سوپرگروه‌ها با اکانت فعال (برای add user)...")
@@ -733,30 +1082,56 @@ async def main_handler(event):
         await event.reply(f"✅ گروه برای add user انتخاب شد:\n{target_group.title}\n(ID: {target_group.id})")
         return
 
-    # ---------- خروج اعضا با ویزارد جدید ----------
+    # ----------- خروج اعضا (export) -----------
 
-    if text == "/export" or text == "📤 خروج اعضا":
-        # اگر قبلاً سشن export داشتی، خالی کن
-        info = export_clients.pop(user_id, None)
-        if info:
-            try:
-                await info["client"].disconnect()
-            except Exception:
-                pass
-        user_states[user_id] = {"mode": "export", "step": "phone", "temp": {}}
-        await event.reply(
-            "شماره اکانتی که می‌خوای باهاش لیست اعضای یک گروه رو بگیری بفرست "
-            "(مثلاً +98912...):"
-        )
+    if text == "📤 خروج اعضا" or text == "/export":
+        accounts = get_export_accounts()
+        if not accounts:
+            user_states[user_id] = {"mode": "export_login", "step": "name", "temp": {}}
+            await event.reply(
+                "هیچ اکانت exportی ثبت نشده.\n"
+                "اول یک اکانت export بساز.\n"
+                "اسم دلخواه برای این اکانت را بفرست (مثلاً exp1):"
+            )
+            return
+
+        temp = {"accounts": accounts}
+        user_states[user_id] = {"mode": "export_select", "step": "choose", "temp": temp}
+
+        lines = ["اکانت‌های export موجود:"]
+        for i, a in enumerate(accounts):
+            lines.append(f"{i}: {a['name']}  phone: {a['phone']}")
+        lines.append('\nیک عدد برای انتخاب اکانت بفرست، یا عبارت "new" برای ساخت اکانت جدید:')
+
+        await event.reply("\n".join(lines))
         return
 
-    # ---------- اگر وسط ویزارد هستیم و پیام جدید دستور / نیست ----------
+    # ----------- logout اکانت‌های export -----------
+
+    if text == "🚪 خروج اکانت‌های export":
+        accounts = get_export_accounts()
+        if not accounts:
+            await event.reply("هیچ اکانت exportی برای logout وجود ندارد.")
+            return
+
+        temp = {"accounts": accounts}
+        user_states[user_id] = {"mode": "logout_export", "step": "choose", "temp": temp}
+
+        lines = ["اکانت‌های export:"]
+        for i, a in enumerate(accounts):
+            lines.append(f"{i}: {a['name']}  phone: {a['phone']}")
+        lines.append("\nشماره اکانتی که می‌خوای logout و حذف کنی رو بفرست:")
+
+        await event.reply("\n".join(lines))
+        return
+
+    # ----------- ادامه‌ی ویزاردها اگر در state هستیم -----------
 
     if user_id in user_states and not text.startswith("/"):
         await handle_state_message(event, user_states[user_id])
         return
 
-    # ---------- سایر موارد ----------
+    # ----------- سایر موارد -----------
 
     if text:
         await event.reply("دستور نامعتبر.\nاز /start یا منوی دکمه‌ای استفاده کن.")
@@ -766,10 +1141,11 @@ async def main_handler(event):
 # ------------------ main ------------------
 
 def main():
-    print("Loading admins, settings, accounts...")
-    load_admins()
-    load_settings()
-    load_accounts()
+    print("Initializing DB and loading data...")
+    init_db()
+    print("Admins:", ADMINS)
+    print("Invite delay:", INVITE_DELAY)
+    print("Loaded add-accounts:", [a["name"] for a in ACCOUNTS_ADD])
 
     print("Bot starting...")
     client.start(bot_token=BOT_TOKEN)
