@@ -2,7 +2,7 @@ import os
 import asyncio
 from aiohttp import web
 
-import bot  # همین bot.py که کنارشه
+import bot  # همین bot.py که کنارش هست
 
 
 routes = web.RouteTableDef()
@@ -13,23 +13,32 @@ async def index(request):
     return web.Response(text="Bot is running ✅")
 
 
-async def start_bot(app):
+async def on_startup(app):
     """
-    این تابع موقع استارت aiohttp صدا زده می‌شه
-    و bot.main() رو تو یه ترد جدا اجرا می‌کنه
-    تا بلاک نشه.
+    موقع استارت وب‌سرور، ربات تلگرام هم روی همون event loop بالا می‌آد.
     """
-    loop = asyncio.get_event_loop()
-    # bot.main بلاک‌کننده‌ست (run_until_disconnected)، پس تو ترد جدا اجراش می‌کنیم
-    loop.create_task(asyncio.to_thread(bot.main))
+    app["bot_task"] = asyncio.create_task(bot.run_bot())
+
+
+async def on_cleanup(app):
+    """
+    موقع خاموش شدن وب‌سرور، تسک ربات رو کنسل می‌کنیم.
+    """
+    task = app.get("bot_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def main():
     app = web.Application()
     app.add_routes(routes)
 
-    # موقع استارت، ربات تلگرام رو هم بالا بیار
-    app.on_startup.append(start_bot)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
 
     port = int(os.environ.get("PORT", "10000"))
     web.run_app(app, host="0.0.0.0", port=port)
