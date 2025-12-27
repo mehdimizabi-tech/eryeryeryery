@@ -1,57 +1,37 @@
 import os
 import asyncio
-
 from aiohttp import web
-import bot  # همین bot.py که کنارش هست
+
+import bot  # همین bot.py که کنارشه
 
 
-async def start_bot():
+routes = web.RouteTableDef()
+
+
+@routes.get("/")
+async def index(request):
+    return web.Response(text="Bot is running ✅")
+
+
+async def start_bot(app):
     """
-    اینجا خود ربات را روی همان event loop بالا می‌آوریم
+    این تابع موقع استارت aiohttp صدا زده می‌شه
+    و bot.main() رو تو یه ترد جدا اجرا می‌کنه
+    تا بلاک نشه.
     """
-    print("Initializing bot...")
-
-    # لود کردن تنظیمات و ادمین‌ها و اکانت‌ها
-    bot.load_admins()
-    bot.load_settings()
-    bot.load_accounts()
-
-    # استارت کلاینت تلگرام با BOT_TOKEN
-    await bot.client.start(bot_token=bot.BOT_TOKEN)
-
-    print("Bot started in web service mode.")
-
-    # یک تسک برای run_until_disconnected ایجاد می‌کنیم تا همیشه گوش بده
-    asyncio.create_task(bot.client.run_until_disconnected())
-    print("Bot run_until_disconnected task created.")
-
-
-async def handle_root(request):
-    return web.json_response({"status": "ok", "message": "Telegram bot is running"})
-
-
-async def on_startup(app):
-    # وقتی وب‌سرور بالا می‌آید، ربات هم استارت می‌شود
-    await start_bot()
-
-
-async def on_cleanup(app):
-    # موقع خاموش شدن وب‌سرور، کلاینت تلگرام را هم می‌بندیم
-    try:
-        await bot.client.disconnect()
-    except Exception:
-        pass
+    loop = asyncio.get_event_loop()
+    # bot.main بلاک‌کننده‌ست (run_until_disconnected)، پس تو ترد جدا اجراش می‌کنیم
+    loop.create_task(asyncio.to_thread(bot.main))
 
 
 def main():
     app = web.Application()
-    app.router.add_get("/", handle_root)
+    app.add_routes(routes)
 
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    # موقع استارت، ربات تلگرام رو هم بالا بیار
+    app.on_startup.append(start_bot)
 
     port = int(os.environ.get("PORT", "10000"))
-    print(f"Starting web server on port {port} ...")
     web.run_app(app, host="0.0.0.0", port=port)
 
 
