@@ -358,8 +358,10 @@ async def handle_state_message(event, state):
             except Exception as e:
                 await event.reply(f"خطا در ارسال کد:\n{e}")
                 traceback.print_exc()
-                ACCOUNTS.remove(get_account_by_name(name))
-                save_accounts()
+                acc = get_account_by_name(name)
+                if acc:
+                    ACCOUNTS.remove(acc)
+                    save_accounts()
                 user_states.pop(user_id, None)
             return
 
@@ -381,6 +383,11 @@ async def handle_state_message(event, state):
                 user_states.pop(user_id, None)
                 await send_main_menu(chat_id, "اکانت اضافه شد. از منو ادامه بده:")
             except PhoneCodeExpiredError:
+                acc = get_account_by_name(name)
+                if acc:
+                    ACCOUNTS.remove(acc)
+                    save_accounts()
+                user_states.pop(user_id, None)
                 await event.reply("کد منقضی شده. دوباره دکمه «➕ افزودن اکانت» را بزن و از اول شروع کن.")
             except SessionPasswordNeededError:
                 await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
@@ -435,7 +442,12 @@ async def handle_state_message(event, state):
             except Exception as e:
                 await event.reply(f"خطا در اتصال/ارسال کد:\n{e}")
                 traceback.print_exc()
-                export_clients.pop(user_id, None)
+                info = export_clients.pop(user_id, None)
+                if info:
+                    try:
+                        await info["client"].disconnect()
+                    except Exception:
+                        pass
                 user_states.pop(user_id, None)
             return
 
@@ -459,6 +471,13 @@ async def handle_state_message(event, state):
                     "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
                 )
             except PhoneCodeExpiredError:
+                info = export_clients.pop(user_id, None)
+                if info:
+                    try:
+                        await info["client"].disconnect()
+                    except Exception:
+                        pass
+                user_states.pop(user_id, None)
                 await event.reply("کد منقضی شده. دوباره دکمه 📤 خروج اعضا را بزن و از اول شروع کن.")
             except SessionPasswordNeededError:
                 await event.reply("برای این شماره رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
@@ -575,9 +594,18 @@ async def main_handler(event):
     if not is_admin(user_id):
         return
 
-    # اگر وسط ویزارد هستیم و پیام دستور / نیست، بفرست به state handler
-    if user_id in user_states and not text.startswith("/"):
-        await handle_state_message(event, user_states[user_id])
+    # اگر فایل CSV فرستاده شده (برای add user)
+    if event.document:
+        file_name = (event.file.name or "").lower()
+        if ".csv" in file_name:
+            await event.reply("فایل CSV دریافت شد، در حال دانلود...")
+            try:
+                file_path = await client.download_media(event.document)
+                await event.reply("فایل دانلود شد، شروع اد کردن اعضا...")
+                await add_users_from_csv_file(file_path, chat_id)
+            except Exception as e:
+                await event.reply(f"خطا در دانلود/پردازش فایل:\n{e}")
+                traceback.print_exc()
         return
 
     # ---------- مدیریت ادمین‌ها ----------
@@ -708,6 +736,13 @@ async def main_handler(event):
     # ---------- خروج اعضا با ویزارد جدید ----------
 
     if text == "/export" or text == "📤 خروج اعضا":
+        # اگر قبلاً سشن export داشتی، خالی کن
+        info = export_clients.pop(user_id, None)
+        if info:
+            try:
+                await info["client"].disconnect()
+            except Exception:
+                pass
         user_states[user_id] = {"mode": "export", "step": "phone", "temp": {}}
         await event.reply(
             "شماره اکانتی که می‌خوای باهاش لیست اعضای یک گروه رو بگیری بفرست "
@@ -715,19 +750,10 @@ async def main_handler(event):
         )
         return
 
-    # ---------- فایل CSV برای add user ----------
+    # ---------- اگر وسط ویزارد هستیم و پیام جدید دستور / نیست ----------
 
-    if event.document:
-        file_name = (event.file.name or "").lower()
-        if ".csv" in file_name:
-            await event.reply("فایل CSV دریافت شد، در حال دانلود...")
-            try:
-                file_path = await client.download_media(event.document)
-                await event.reply("فایل دانلود شد، شروع اد کردن اعضا...")
-                await add_users_from_csv_file(file_path, chat_id)
-            except Exception as e:
-                await event.reply(f"خطا در دانلود/پردازش فایل:\n{e}")
-                traceback.print_exc()
+    if user_id in user_states and not text.startswith("/"):
+        await handle_state_message(event, user_states[user_id])
         return
 
     # ---------- سایر موارد ----------
