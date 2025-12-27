@@ -11,6 +11,7 @@ from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.errors.rpcerrorlist import PeerFloodError, UserPrivacyRestrictedError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
 
 
 # ------------------ تنظیمات محیطی (برای خود ربات Bot) ------------------
@@ -43,7 +44,7 @@ account_clients = {}   # name -> TelegramClient (اکانت‌ها برای add 
 user_states = {}       # user_id -> {"mode": ..., "step": ..., "temp": {...}}
 
 # برای ویزارد جدید export (شماره → کد → chat_id)
-export_clients = {}    # user_id -> {"client": TelegramClient, "phone": str}
+export_clients = {}    # user_id -> {"client": TelegramClient, "phone": str, "phone_code_hash": str | None}
 
 # وضعیت گروه‌ها برای add user
 groups_cache = []              # لیست گروه‌ها برای add user
@@ -346,7 +347,8 @@ async def handle_state_message(event, state):
 
             try:
                 user_client = await get_account_client(name)
-                await user_client.send_code_request(phone)
+                sent = await user_client.send_code_request(phone)
+                temp["phone_code_hash"] = sent.phone_code_hash
                 state["step"] = "code"
                 state["temp"] = temp
                 user_states[user_id] = state
@@ -365,9 +367,10 @@ async def handle_state_message(event, state):
             code = text
             name = temp["name"]
             phone = temp["phone"]
+            phone_code_hash = temp.get("phone_code_hash")
             try:
                 user_client = await get_account_client(name)
-                await user_client.sign_in(phone=phone, code=code)
+                await user_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
                 await event.reply(f"✅ اکانت {name} برای add user لاگین شد.")
 
                 global ACTIVE_ACCOUNT
@@ -377,8 +380,12 @@ async def handle_state_message(event, state):
 
                 user_states.pop(user_id, None)
                 await send_main_menu(chat_id, "اکانت اضافه شد. از منو ادامه بده:")
+            except PhoneCodeExpiredError:
+                await event.reply("کد منقضی شده. دوباره دکمه «➕ افزودن اکانت» را بزن و از اول شروع کن.")
+            except SessionPasswordNeededError:
+                await event.reply("برای این اکانت رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
             except Exception as e:
-                await event.reply(f"خطا در تایید کد:\n{e}")
+                await event.reply(f"خطا در لاگین:\n{e}")
                 traceback.print_exc()
             return
 
@@ -408,7 +415,7 @@ async def handle_state_message(event, state):
 
             session_name = "export_" + re.sub(r"[^0-9]+", "", phone)
             uclient = TelegramClient(session_name, API_ID, API_HASH)
-            export_clients[user_id] = {"client": uclient, "phone": phone}
+            export_clients[user_id] = {"client": uclient, "phone": phone, "phone_code_hash": None}
 
             try:
                 await uclient.connect()
@@ -420,7 +427,8 @@ async def handle_state_message(event, state):
                         "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
                     )
                 else:
-                    await uclient.send_code_request(phone)
+                    sent = await uclient.send_code_request(phone)
+                    export_clients[user_id]["phone_code_hash"] = sent.phone_code_hash
                     state["step"] = "code"
                     user_states[user_id] = state
                     await event.reply("کد ارسال‌شده به تلگرام را بفرست (فقط عدد):")
@@ -440,15 +448,20 @@ async def handle_state_message(event, state):
                 return
             uclient = info["client"]
             phone = info["phone"]
+            phone_code_hash = info.get("phone_code_hash")
             code = text
             try:
-                await uclient.sign_in(phone=phone, code=code)
+                await uclient.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
                 state["step"] = "chat_id"
                 user_states[user_id] = state
                 await event.reply(
                     "✅ لاگین شدی.\n"
                     "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
                 )
+            except PhoneCodeExpiredError:
+                await event.reply("کد منقضی شده. دوباره دکمه 📤 خروج اعضا را بزن و از اول شروع کن.")
+            except SessionPasswordNeededError:
+                await event.reply("برای این شماره رمز دو مرحله‌ای فعال است. این ربات فعلاً از 2FA پشتیبانی نمی‌کند.")
             except Exception as e:
                 await event.reply(f"خطا در لاگین:\n{e}")
                 traceback.print_exc()
