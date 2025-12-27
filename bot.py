@@ -1122,19 +1122,30 @@ async def main_handler(event):
         return
 
 
-# ------------------ main ------------------
+# ------------------ main (async) ------------------
 
-def main():
+async def run_bot():
+    """
+    این تابع ربات تلگرام رو روی event loop اجرا می‌کند
+    (برای استفاده در web.py داخل aiohttp)
+    """
     print("Initializing DB and loading data...")
     init_db()
     print("Admins:", ADMINS)
     print("Invite delay:", INVITE_DELAY)
     print("Loaded add-accounts:", [a["name"] for a in ACCOUNTS_ADD])
 
-    print("Bot starting...")
-    client.start(bot_token=BOT_TOKEN)
+    print("Bot starting (async)...")
+    await client.start(bot_token=BOT_TOKEN)
     print("Bot is running. Waiting for commands...")
-    client.run_until_disconnected()
+    await client.run_until_disconnected()
+
+
+def main():
+    """
+    برای وقتی که بخوای مستقیماً `python bot.py` اجرا کنی.
+    """
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
