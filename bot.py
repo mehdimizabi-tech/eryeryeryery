@@ -5,8 +5,8 @@ import re
 import asyncio
 import traceback
 
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import GetDialogsRequest
@@ -56,49 +56,47 @@ target_group = None
 awaiting_group_number = False
 
 
-# ------------------ توابع دیتابیس (PostgreSQL) ------------------
+# ------------------ توابع دیتابیس (PostgreSQL - psycopg3) ------------------
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    # autocommit خاموش است؛ خودمان commit می‌کنیم
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
     """ایجاد جداول و لود تنظیمات/ادمین/اکانت‌ها"""
-    conn = get_db_connection()
-    cur = conn.cursor()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # جدول ادمین‌ها
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
 
-    # جدول ادمین‌ها
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY
-        )
-    """)
+            # تنظیمات کلی
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
 
-    # تنظیمات کلی
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
+            # اکانت‌ها (add + export)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    phone TEXT,
+                    api_id BIGINT NOT NULL,
+                    api_hash TEXT NOT NULL,
+                    session_string TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('add', 'export')),
+                    UNIQUE(name, kind)
+                )
+            """)
 
-    # اکانت‌ها (add + export)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            id BIGSERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            phone TEXT,
-            api_id BIGINT NOT NULL,
-            api_hash TEXT NOT NULL,
-            session_string TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK (kind IN ('add', 'export')),
-            UNIQUE(name, kind)
-        )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn.commit()
 
     load_admins_from_db()
     load_settings_from_db()
@@ -107,143 +105,130 @@ def init_db():
 
 def load_admins_from_db():
     global ADMINS
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT user_id FROM admins")
-    rows = cur.fetchall()
-    ADMINS = {row["user_id"] for row in rows}
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT user_id FROM admins")
+            rows = cur.fetchall()
+            ADMINS = {row["user_id"] for row in rows}
 
-    # حتماً OWNER_ID همیشه ادمین باشد
-    if OWNER_ID not in ADMINS:
-        cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (OWNER_ID,))
-        conn.commit()
-        ADMINS.add(OWNER_ID)
-
-    cur.close()
-    conn.close()
+            # حتماً OWNER_ID همیشه ادمین باشد
+            if OWNER_ID not in ADMINS:
+                cur.execute(
+                    "INSERT INTO admins (user_id) VALUES (%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (OWNER_ID,),
+                )
+                conn.commit()
+                ADMINS.add(OWNER_ID)
 
 
 def add_admin_db(user_id: int):
     global ADMINS
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO admins (user_id) VALUES (%s) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                (user_id,),
+            )
+            conn.commit()
     ADMINS.add(user_id)
 
 
 def remove_admin_db(user_id: int):
     global ADMINS
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+            conn.commit()
     if user_id in ADMINS:
         ADMINS.remove(user_id)
 
 
 def load_settings_from_db():
     global INVITE_DELAY, ACTIVE_ADD_ACCOUNT
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT value FROM settings WHERE key = 'invite_delay'")
+            row = cur.fetchone()
+            if row:
+                try:
+                    INVITE_DELAY = int(row["value"])
+                except ValueError:
+                    INVITE_DELAY = 60
+            else:
+                INVITE_DELAY = 60
 
-    cur.execute("SELECT value FROM settings WHERE key = 'invite_delay'")
-    row = cur.fetchone()
-    if row:
-        try:
-            INVITE_DELAY = int(row["value"])
-        except ValueError:
-            INVITE_DELAY = 60
-    else:
-        INVITE_DELAY = 60
-
-    cur.execute("SELECT value FROM settings WHERE key = 'active_add_account'")
-    row = cur.fetchone()
-    if row:
-        ACTIVE_ADD_ACCOUNT = row["value"]
-    else:
-        ACTIVE_ADD_ACCOUNT = None
-
-    cur.close()
-    conn.close()
+            cur.execute("SELECT value FROM settings WHERE key = 'active_add_account'")
+            row = cur.fetchone()
+            if row:
+                ACTIVE_ADD_ACCOUNT = row["value"]
+            else:
+                ACTIVE_ADD_ACCOUNT = None
 
 
 def set_setting(key: str, value: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO settings(key, value)
-        VALUES (%s, %s)
-        ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
-        """,
-        (key, value),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES (%s, %s)
+                ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                (key, value),
+            )
+            conn.commit()
 
 
 def load_accounts_add_from_db():
     """فقط اکانت‌های نوع add را در حافظه می‌آورد"""
     global ACCOUNTS_ADD
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM accounts WHERE kind = 'add'")
-    rows = cur.fetchall()
-    ACCOUNTS_ADD = []
-    for r in rows:
-        ACCOUNTS_ADD.append({
-            "id": r["id"],
-            "name": r["name"],
-            "phone": r["phone"],
-            "api_id": r["api_id"],
-            "api_hash": r["api_hash"],
-            "session_string": r["session_string"],
-        })
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM accounts WHERE kind = 'add'")
+            rows = cur.fetchall()
+            ACCOUNTS_ADD = []
+            for r in rows:
+                ACCOUNTS_ADD.append({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "phone": r["phone"],
+                    "api_id": r["api_id"],
+                    "api_hash": r["api_hash"],
+                    "session_string": r["session_string"],
+                })
 
 
 def insert_account(name, phone, api_id, api_hash, session_string, kind):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO accounts(name, phone, api_id, api_hash, session_string, kind)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (name, phone, api_id, api_hash, session_string, kind),
-    )
-    acc_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO accounts(name, phone, api_id, api_hash, session_string, kind)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (name, phone, api_id, api_hash, session_string, kind),
+            )
+            acc_id = cur.fetchone()[0]
+            conn.commit()
     return acc_id
 
 
 def delete_account_by_id(acc_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM accounts WHERE id = %s", (acc_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM accounts WHERE id = %s", (acc_id,))
+            conn.commit()
 
 
 def get_export_accounts():
     """لیست همه اکانت‌های export از دیتابیس"""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT id, name, phone FROM accounts WHERE kind = 'export'")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, name, phone FROM accounts WHERE kind = 'export'")
+            rows = cur.fetchall()
     accounts = []
     for r in rows:
         accounts.append({
@@ -255,22 +240,21 @@ def get_export_accounts():
 
 
 def get_account_row_by_id(acc_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM accounts WHERE id = %s", (acc_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM accounts WHERE id = %s", (acc_id,))
+            row = cur.fetchone()
     return row
 
 
 def export_account_name_exists(name: str) -> bool:
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM accounts WHERE kind = 'export' AND name = %s", (name,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM accounts WHERE kind = 'export' AND name = %s",
+                (name,),
+            )
+            row = cur.fetchone()
     return row is not None
 
 
