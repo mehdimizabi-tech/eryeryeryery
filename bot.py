@@ -10,10 +10,14 @@ import psycopg
 from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser
-from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.errors.rpcerrorlist import PeerFloodError, UserPrivacyRestrictedError
+from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from telethon.errors.rpcerrorlist import (
+    PeerFloodError,
+    UserPrivacyRestrictedError,
+    UserAlreadyParticipantError,
+)
 from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
 
@@ -46,14 +50,14 @@ INVITE_DELAY = 60             # ثانیه، در حالت fixed
 INVITE_DELAY_MODE = "fixed"   # "fixed" یا "random" (30-100)
 
 ACCOUNTS_ADD = []             # list of dicts: {id, name, phone, api_id, api_hash, session_string}
-ACTIVE_ADD_ACCOUNT = None     # نام اکانت فعال برای add user (فقط برای گرفتن لیست گروه‌ها)
+ACTIVE_ADD_ACCOUNT = None     # (الان فقط برای نمایش استفاده می‌شود)
 
 user_states = {}           # user_id -> {mode, step, temp}
 login_clients_add = {}     # user_id -> TelegramClient موقت هنگام لاگین add
 login_clients_export = {}  # user_id -> TelegramClient موقت هنگام لاگین export
 
-groups_cache = []
-target_group = None
+groups_cache = []          # آخرین لیست گروه‌های گرفته‌شده
+target_group = None        # گروه انتخاب‌شده برای add
 awaiting_group_number = False
 
 
@@ -168,7 +172,7 @@ def load_settings_from_db():
             else:
                 INVITE_DELAY_MODE = "fixed"
 
-            # اکانت فعال
+            # اکانت فعال (الان فقط برای نمایش)
             cur.execute("SELECT value FROM settings WHERE key = 'active_add_account'")
             row = cur.fetchone()
             if row:
@@ -288,7 +292,7 @@ def main_menu():
             Button.text("📜 اکانت‌ها"),
         ],
         [
-            Button.text("🧾 گروه‌ها"),
+            Button.text("🧾 شروع add"),
             Button.text("📤 خروج اعضا"),
         ],
         [
@@ -297,6 +301,7 @@ def main_menu():
         ],
         [
             Button.text("🚪 خروج اکانت‌های export"),
+            Button.text("👥 جوین اکانت‌ها"),
         ],
     ]
 
@@ -305,12 +310,12 @@ async def send_main_menu(chat_id, text="از منوی زیر استفاده کن
     await client.send_message(chat_id, text, buttons=main_menu())
 
 
-# ------------------ کمک برای add user ------------------
+# ------------------ کمک برای add user (قدیمی، فقط نمایشی) ------------------
 
 async def get_add_account_client():
     """
-    فقط برای گرفتن لیست گروه‌ها از یک اکانت فعال استفاده می‌شود.
-    خود add از همه اکانت‌های ACCOUNTS_ADD استفاده می‌کند.
+    فقط در نسخه قبلی برای گرفتن لیست گروه‌ها از اکانت add استفاده می‌شد.
+    الان برای add از همه ACCOUNTS_ADD استفاده می‌کنیم و گروه‌ها از اکانت export گرفته می‌شوند.
     """
     if not ACTIVE_ADD_ACCOUNT:
         raise RuntimeError("هیچ اکانت فعالی برای add user تنظیم نشده است.")
@@ -326,36 +331,159 @@ async def get_add_account_client():
     return user_client
 
 
-async def fetch_groups_for_active():
-    """لیست گروه‌های اکانت فعال برای add user (برای انتخاب گروه هدف)"""
-    global groups_cache
-    user_client = await get_add_account_client()
-    result = await user_client(GetDialogsRequest(
-        offset_date=None,
-        offset_id=0,
-        offset_peer=InputPeerEmpty(),
-        limit=200,
-        hash=0
-    ))
-    groups_cache = [c for c in result.chats if getattr(c, "megagroup", False)]
-    await user_client.disconnect()
-    return groups_cache
-
-
-def groups_text():
-    if not groups_cache:
-        return "هیچ سوپرگروهی یافت نشد (یا این اکانت در سوپرگروهی نیست)."
-    lines = [f"اکانت فعال برای گرفتن لیست گروه‌ها: {ACTIVE_ADD_ACCOUNT}\n", "لیست سوپرگروه‌ها:"]
-    for i, g in enumerate(groups_cache):
-        lines.append(f"{i}: {g.title}")
-    lines.append("\nیک عدد بفرست تا همان گروه برای add user انتخاب شود.\n"
-                 "⚠️ توجه: بعد از انتخاب گروه، در مرحله add همه اکانت‌های add با هم استفاده می‌شوند.")
-    return "\n".join(lines)
-
-
 def sanitize_filename(title: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower())
     return f"members-{safe}.csv"
+
+
+# ------------------ helper: جوین همه اکانت‌های add به یک گروه با لینک ------------------
+
+def parse_group_link(link: str):
+    """
+    ورودی: لینک عمومی یا خصوصی تلگرام
+    خروجی:
+      (mode, value)
+      mode = "invite" => value = invite_hash
+      mode = "username" => value = username / @username / لینک عمومی
+    """
+    link = link.strip()
+
+    # حذف http/https
+    if link.startswith("https://"):
+        link = link[len("https://"):]
+    elif link.startswith("http://"):
+        link = link[len("http://"):]
+
+    # الان ممکنه t.me/xxx یا فقط username یا @username باشد
+    # اول چک کنیم joinchat
+    if "joinchat/" in link:
+        # مثل: t.me/joinchat/XXXX یا telegram.me/joinchat/XXXX
+        part = link.split("joinchat/", 1)[1]
+        invite_hash = part.split("?", 1)[0]
+        return "invite", invite_hash
+
+    # لینک t.me/+HASH
+    if "t.me/+" in link:
+        part = link.split("t.me/+", 1)[1]
+        invite_hash = part.split("?", 1)[0]
+        return "invite", invite_hash
+
+    # اگر t.me/ داریم
+    if link.startswith("t.me/"):
+        after = link[len("t.me/"):]
+    else:
+        after = link
+
+    # اگر بعدی با + شروع شود، باز هم invite است
+    if after.startswith("+"):
+        invite_hash = after[1:].split("?", 1)[0]
+        return "invite", invite_hash
+
+    # اگر @username باشد
+    if after.startswith("@"):
+        username = after[1:]
+    else:
+        username = after
+
+    # اگر باز هم / داشته باشد، بخش اول را بگیریم
+    if "/" in username:
+        username = username.split("/", 1)[0]
+
+    return "username", username
+
+
+async def join_all_add_accounts(group_link: str, chat_id: int):
+    """
+    با استفاده از همه اکانت‌های add به گروه مقصد جوین می‌کند.
+    """
+    if not ACCOUNTS_ADD:
+        await client.send_message(chat_id, "هیچ اکانتی برای add user ثبت نشده.")
+        return
+
+    mode, value = parse_group_link(group_link)
+
+    await client.send_message(
+        chat_id,
+        f"در حال جوین کردن همه اکانت‌های add به گروه با لینک:\n{group_link}"
+    )
+
+    for acc in ACCOUNTS_ADD:
+        name = acc["name"]
+        api_id = acc["api_id"]
+        api_hash = acc["api_hash"]
+        session_string = acc["session_string"]
+
+        session = StringSession(session_string)
+        user_client = TelegramClient(session, api_id, api_hash)
+
+        try:
+            await user_client.connect()
+            if not await user_client.is_user_authorized():
+                await client.send_message(chat_id, f"⚠️ [{name}] لاگین نیست، از این اکانت استفاده نشد.")
+                continue
+
+            try:
+                if mode == "invite":
+                    # لینک خصوصی
+                    invite_hash = value
+                    try:
+                        await user_client(ImportChatInviteRequest(invite_hash))
+                        await client.send_message(
+                            chat_id,
+                            f"✅ [{name}] با لینک خصوصی به گروه join شد."
+                        )
+                    except UserAlreadyParticipantError:
+                        await client.send_message(
+                            chat_id,
+                            f"ℹ️ [{name}] قبلاً عضو این گروه بوده."
+                        )
+                else:
+                    # لینک عمومی / یوزرنیم
+                    username = value
+                    try:
+                        entity = await user_client.get_entity(username)
+                    except Exception as ee:
+                        await client.send_message(
+                            chat_id,
+                            f"⚠️ [{name}] نتوانست گروه را از روی لینک/یوزرنیم پیدا کند:\n{ee}"
+                        )
+                        continue
+
+                    try:
+                        await user_client(JoinChannelRequest(entity))
+                        await client.send_message(
+                            chat_id,
+                            f"✅ [{name}] به گروه عمومی join شد."
+                        )
+                    except UserAlreadyParticipantError:
+                        await client.send_message(
+                            chat_id,
+                            f"ℹ️ [{name}] قبلاً عضو این گروه بوده."
+                        )
+
+            except Exception as e:
+                await client.send_message(
+                    chat_id,
+                    f"❌ خطا در جوین برای اکانت [{name}]:\n{e}"
+                )
+                traceback.print_exc()
+
+        except Exception as e:
+            await client.send_message(
+                chat_id,
+                f"❌ خطا در اتصال سشن [{name}]:\n{e}"
+            )
+            traceback.print_exc()
+        finally:
+            try:
+                await user_client.disconnect()
+            except:
+                pass
+
+    await client.send_message(
+        chat_id,
+        "✅ فرآیند جوین برای همه اکانت‌های add تمام شد."
+    )
 
 
 # ------------------ add multi-account از CSV ------------------
@@ -375,7 +503,7 @@ async def add_users_from_csv_file(file_path, chat_id):
         return
 
     if target_group is None:
-        await client.send_message(chat_id, "هیچ گروهی برای add user انتخاب نشده. از دکمه 🧾 گروه‌ها استفاده کن.")
+        await client.send_message(chat_id, "هیچ گروهی برای add user انتخاب نشده. از دکمه 🧾 شروع add استفاده کن.")
         return
 
     # خواندن CSV
@@ -516,6 +644,7 @@ async def add_users_from_csv_file(file_path, chat_id):
 async def handle_state_message(event, state):
     """هدل کردن ویزاردها"""
     global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD, INVITE_DELAY_MODE
+    global groups_cache, awaiting_group_number, target_group
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -523,6 +652,86 @@ async def handle_state_message(event, state):
     mode = state.get("mode")
     step = state.get("step")
     temp = state.get("temp", {})
+
+    # ---------- انتخاب اکانت export برای شروع add (گرفتن لیست گروه‌ها) ----------
+    if mode == "add_choose_export":
+        if step == "choose":
+            accounts = temp.get("accounts", [])
+            if not text.isdigit():
+                await event.reply("فقط شماره اکانت export را بفرست (مثلاً 0 یا 1).")
+                return
+            idx = int(text)
+            if idx < 0 or idx >= len(accounts):
+                await event.reply("شماره نامعتبر است. دوباره سعی کن.")
+                return
+
+            acc_meta = accounts[idx]
+            acc_id = acc_meta["id"]
+            row = get_account_row_by_id(acc_id)
+            if not row:
+                await event.reply("این اکانت export در دیتابیس پیدا نشد.")
+                user_states.pop(user_id, None)
+                return
+
+            name = row["name"]
+            api_id = row["api_id"]
+            api_hash = row["api_hash"]
+            session_string = row["session_string"]
+
+            session = StringSession(session_string)
+            export_client = TelegramClient(session, api_id, api_hash)
+
+            try:
+                await export_client.connect()
+                if not await export_client.is_user_authorized():
+                    await event.reply("این اکانت export دیگر لاگین نیست. دوباره از «📤 خروج اعضا» آن را بساز.")
+                    await export_client.disconnect()
+                    user_states.pop(user_id, None)
+                    return
+
+                result = await export_client(GetDialogsRequest(
+                    offset_date=None,
+                    offset_id=0,
+                    offset_peer=InputPeerEmpty(),
+                    limit=200,
+                    hash=0
+                ))
+                groups_cache = [c for c in result.chats if getattr(c, "megagroup", False)]
+                await export_client.disconnect()
+
+                if not groups_cache:
+                    await event.reply("هیچ سوپرگروهی در این اکانت export پیدا نشد.")
+                    user_states.pop(user_id, None)
+                    return
+
+                lines = [f"لیست سوپرگروه‌ها با اکانت export `{name}`:\n"]
+                for i, g in enumerate(groups_cache):
+                    lines.append(f"{i}: {g.title}")
+                lines.append("\nیک عدد بفرست تا همان گروه برای add user انتخاب شود.\n"
+                             "بعد از انتخاب گروه، فایل CSV را بفرست تا add انجام شود.")
+
+                awaiting_group_number = True
+                user_states.pop(user_id, None)
+                await event.reply("\n".join(lines), parse_mode="markdown")
+
+            except Exception as e:
+                await event.reply(f"خطا در گرفتن لیست گروه‌ها از اکانت export:\n{e}")
+                traceback.print_exc()
+                try:
+                    await export_client.disconnect()
+                except:
+                    pass
+                user_states.pop(user_id, None)
+            return
+
+    # ---------- جوین همه اکانت‌های add به گروه ----------
+    if mode == "join_all_add":
+        if step == "link":
+            group_link = text
+            user_states.pop(user_id, None)
+            await join_all_add_accounts(group_link, chat_id)
+            await send_main_menu(chat_id, "کار جوین اکانت‌ها تمام شد. از منو ادامه بده:")
+            return
 
     # ---------- افزودن اکانت add با لاگین کد + 2FA ----------
     if mode == "addacc":
@@ -1123,7 +1332,7 @@ async def main_handler(event):
                 "از دکمه‌های زیر برای مدیریت استفاده کن.\n\n"
                 "دستورات تکمیلی:\n"
                 "/accounts  → لیست اکانت‌های add\n"
-                "/useacc <name> → انتخاب اکانت فعال برای دیدن گروه‌ها\n"
+                "/useacc <name> → فقط برای علامت‌گذاری اکانت فعال (نمایشی)\n"
                 "/delacc <name> → حذف اکانت add\n"
                 "/admins → لیست ادمین‌ها\n"
                 "/addadmin <id> /deladmin <id>\n"
@@ -1237,7 +1446,7 @@ async def main_handler(event):
         else:
             lines = ["اکانت‌های add:\n"]
             for acc in ACCOUNTS_ADD:
-                mark = "(active-for-groups)" if acc["name"] == ACTIVE_ADD_ACCOUNT else ""
+                mark = "(active-for-display)" if acc["name"] == ACTIVE_ADD_ACCOUNT else ""
                 lines.append(f"- {acc['name']} {mark}  phone: {acc['phone']}")
             lines.append("\n⚠️ همه‌ی این اکانت‌ها در add از CSV استفاده می‌شوند.")
             await event.reply("\n".join(lines))
@@ -1255,7 +1464,7 @@ async def main_handler(event):
             return
         ACTIVE_ADD_ACCOUNT = name
         set_setting("active_add_account", name)
-        await event.reply(f"✅ اکانت فعال برای گرفتن لیست گروه‌ها تنظیم شد: {name}")
+        await event.reply(f"✅ اکانت فعال (فقط نمایشی) تنظیم شد: {name}")
         return
 
     if text.startswith("/delacc"):
@@ -1298,40 +1507,44 @@ async def main_handler(event):
         await event.reply("\n".join(lines))
         return
 
-    # ----------- مدیریت گروه‌ها برای add -----------
+    # ----------- انتخاب گروه برای add (با اکانت export) -----------
 
-    if text == "🧾 گروه‌ها" or text == "/groups":
-        if not ACTIVE_ADD_ACCOUNT:
+    if text == "🧾 شروع add" or text == "/groups":
+        if not ACCOUNTS_ADD:
+            await event.reply("هیچ اکانتی برای add user ثبت نشده. اول از «➕ افزودن اکانت» استفاده کن.")
+            return
+
+        accounts = get_export_accounts()
+        if not accounts:
             await event.reply(
-                "هیچ اکانتی برای گرفتن لیست گروه‌ها فعال نیست.\n"
-                "از /useacc <name> استفاده کن یا اکانت add جدید بساز."
+                "هیچ اکانت export ثبت نشده.\n"
+                "اول از طریق «📤 خروج اعضا» یک اکانت export بساز تا بتوانم با آن لیست گروه‌ها را بگیرم."
             )
             return
-        await event.reply(
-            "در حال گرفتن لیست سوپرگروه‌ها با اکانت فعال (فقط برای انتخاب گروه هدف)..."
-        )
-        try:
-            await fetch_groups_for_active()
-            msg = groups_text()
-            awaiting_group_number = True
-            await event.reply(msg)
-        except Exception as e:
-            awaiting_group_number = False
-            await event.reply(f"خطا در گرفتن لیست گروه‌ها:\n{e}")
-            traceback.print_exc()
+
+        temp = {"accounts": accounts}
+        user_states[user_id] = {"mode": "add_choose_export", "step": "choose", "temp": temp}
+
+        lines = ["برای شروع add، اول اکانت export را انتخاب کن:"]
+        for i, a in enumerate(accounts):
+            lines.append(f"{i}: {a['name']}  phone: {a['phone']}")
+        lines.append("\nشماره اکانت export را بفرست (مثلاً 0):")
+
+        await event.reply("\n".join(lines))
         return
 
     if awaiting_group_number and text.isdigit():
         idx = int(text)
         if idx < 0 or idx >= len(groups_cache):
-            await event.reply("شماره گروه نامعتبر است. دوباره دکمه 🧾 گروه‌ها را بزن.")
+            await event.reply("شماره گروه نامعتبر است. دوباره دکمه 🧾 شروع add را بزن.")
             return
+        global target_group
         target_group = groups_cache[idx]
         awaiting_group_number = False
         await event.reply(
             f"✅ گروه برای add user انتخاب شد:\n{target_group.title}\n"
             f"(ID: {target_group.id})\n\n"
-            f"از این به بعد، هنگام ارسال CSV، همه اکانت‌های add روی این گروه کار می‌کنند."
+            f"حالا فایل CSV را بفرست تا با همه اکانت‌های add روی این گروه add انجام شود."
         )
         return
 
@@ -1376,6 +1589,22 @@ async def main_handler(event):
         lines.append("\nشماره اکانتی که می‌خوای logout و حذف کنی رو بفرست:")
 
         await event.reply("\n".join(lines))
+        return
+
+    # ----------- جوین همه اکانت‌های add با لینک -----------
+
+    if text == "👥 جوین اکانت‌ها":
+        if not ACCOUNTS_ADD:
+            await event.reply("هیچ اکانتی برای add user ثبت نشده.")
+            return
+        user_states[user_id] = {"mode": "join_all_add", "step": "link", "temp": {}}
+        await event.reply(
+            "لینک گروه مقصد را بفرست (عمومی یا خصوصی):\n"
+            "مثال‌ها:\n"
+            "https://t.me/SBMUgap\n"
+            "t.me/SBMUgap\n"
+            "https://t.me/+_FVFe-WWKtRhZTdk"
+        )
         return
 
     # ----------- ادامه‌ی ویزاردها اگر در state هستیم -----------
