@@ -4,7 +4,7 @@ import io
 import re
 import asyncio
 import traceback
-import random  # برای تاخیر رندوم
+import random
 
 import psycopg
 from psycopg.rows import dict_row
@@ -24,7 +24,7 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# آیدی عددی ادمین اصلی (ثابت طبق چیزی که دادی)
+# آیدی عددی ادمین اصلی
 OWNER_ID = 6474515118
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -45,9 +45,8 @@ ADMINS = set()
 INVITE_DELAY = 60             # ثانیه، در حالت fixed
 INVITE_DELAY_MODE = "fixed"   # "fixed" یا "random" (30-100)
 
-# فقط اکانت‌های نوع add را در حافظه نگه می‌داریم
-ACCOUNTS_ADD = []  # list of dicts: {id, name, phone, api_id, api_hash, session_string}
-ACTIVE_ADD_ACCOUNT = None
+ACCOUNTS_ADD = []             # list of dicts: {id, name, phone, api_id, api_hash, session_string}
+ACTIVE_ADD_ACCOUNT = None     # نام اکانت فعال برای add user (فقط برای گرفتن لیست گروه‌ها)
 
 user_states = {}           # user_id -> {mode, step, temp}
 login_clients_add = {}     # user_id -> TelegramClient موقت هنگام لاگین add
@@ -61,7 +60,6 @@ awaiting_group_number = False
 # ------------------ توابع دیتابیس (PostgreSQL - psycopg3) ------------------
 
 def get_db_connection():
-    # autocommit خاموش است؛ خودمان commit می‌کنیم
     return psycopg.connect(DATABASE_URL)
 
 
@@ -115,12 +113,13 @@ def load_admins_from_db():
 
             # حتماً OWNER_ID همیشه ادمین باشد
             if OWNER_ID not in ADMINS:
-                cur.execute(
-                    "INSERT INTO admins (user_id) VALUES (%s) "
-                    "ON CONFLICT (user_id) DO NOTHING",
-                    (OWNER_ID,),
-                )
-                conn.commit()
+                with conn.cursor() as cur2:
+                    cur2.execute(
+                        "INSERT INTO admins (user_id) VALUES (%s) "
+                        "ON CONFLICT (user_id) DO NOTHING",
+                        (OWNER_ID,),
+                    )
+                    conn.commit()
                 ADMINS.add(OWNER_ID)
 
 
@@ -143,8 +142,7 @@ def remove_admin_db(user_id: int):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
             conn.commit()
-    if user_id in ADMINS:
-        ADMINS.remove(user_id)
+    ADMINS.discard(user_id)
 
 
 def load_settings_from_db():
@@ -310,7 +308,10 @@ async def send_main_menu(chat_id, text="از منوی زیر استفاده کن
 # ------------------ کمک برای add user ------------------
 
 async def get_add_account_client():
-    """کلاینت اکانت فعال برای add user (از روی StringSession در دیتابیس)"""
+    """
+    فقط برای گرفتن لیست گروه‌ها از یک اکانت فعال استفاده می‌شود.
+    خود add از همه اکانت‌های ACCOUNTS_ADD استفاده می‌کند.
+    """
     if not ACTIVE_ADD_ACCOUNT:
         raise RuntimeError("هیچ اکانت فعالی برای add user تنظیم نشده است.")
     acc = get_add_account_by_name(ACTIVE_ADD_ACCOUNT)
@@ -326,7 +327,7 @@ async def get_add_account_client():
 
 
 async def fetch_groups_for_active():
-    """لیست گروه‌های اکانت فعال برای add user"""
+    """لیست گروه‌های اکانت فعال برای add user (برای انتخاب گروه هدف)"""
     global groups_cache
     user_client = await get_add_account_client()
     result = await user_client(GetDialogsRequest(
@@ -344,10 +345,11 @@ async def fetch_groups_for_active():
 def groups_text():
     if not groups_cache:
         return "هیچ سوپرگروهی یافت نشد (یا این اکانت در سوپرگروهی نیست)."
-    lines = [f"اکانت فعال برای add user: {ACTIVE_ADD_ACCOUNT}\n", "لیست سوپرگروه‌ها:"]
+    lines = [f"اکانت فعال برای گرفتن لیست گروه‌ها: {ACTIVE_ADD_ACCOUNT}\n", "لیست سوپرگروه‌ها:"]
     for i, g in enumerate(groups_cache):
         lines.append(f"{i}: {g.title}")
-    lines.append("\nیک عدد بفرست تا همان گروه برای add user انتخاب شود.")
+    lines.append("\nیک عدد بفرست تا همان گروه برای add user انتخاب شود.\n"
+                 "⚠️ توجه: بعد از انتخاب گروه، در مرحله add همه اکانت‌های add با هم استفاده می‌شوند.")
     return "\n".join(lines)
 
 
@@ -356,27 +358,32 @@ def sanitize_filename(title: str) -> str:
     return f"members-{safe}.csv"
 
 
+# ------------------ add multi-account از CSV ------------------
+
 async def add_users_from_csv_file(file_path, chat_id):
-    """add user از CSV با استفاده از اکانت فعال و گروه انتخاب‌شده"""
+    """
+    add user از CSV با استفاده از همه اکانت‌های ACCOUNTS_ADD.
+    - لیست یوزرها بین اکانت‌ها به صورت Round Robin تقسیم می‌شود.
+    - برای هر اکانت یک کلاینت جدا ساخته می‌شود.
+    - همه اکانت‌ها همزمان کار می‌کنند.
+    - تاخیر برای هر اکانت مستقل اعمال می‌شود.
+    """
     global target_group
-    if not ACTIVE_ADD_ACCOUNT:
-        await client.send_message(chat_id, "هیچ اکانتی برای add user فعال نیست. اول اکانت را تنظیم کن.")
+
+    if not ACCOUNTS_ADD:
+        await client.send_message(chat_id, "هیچ اکانتی برای add user ثبت نشده. اول از «➕ افزودن اکانت» استفاده کن.")
         return
+
     if target_group is None:
         await client.send_message(chat_id, "هیچ گروهی برای add user انتخاب نشده. از دکمه 🧾 گروه‌ها استفاده کن.")
         return
 
-    try:
-        user_client = await get_add_account_client()
-    except Exception as e:
-        await client.send_message(chat_id, f"خطا در گرفتن کلاینت اکانت add:\n{e}")
-        return
-
+    # خواندن CSV
     users = []
     try:
         with open(file_path, encoding="utf-8") as f:
             reader = csv.reader(f, delimiter=",", lineterminator="\n")
-            next(reader, None)
+            next(reader, None)  # پرش از هدر
             for row in reader:
                 if len(row) < 3:
                     continue
@@ -386,46 +393,122 @@ async def add_users_from_csv_file(file_path, chat_id):
                     "access_hash": int(row[2]) if row[2] else 0
                 })
     except Exception as e:
-        await client.send_message(chat_id, f"خطا در خواندن CSV:\n{e}")
+        await client.send_message(chat_id, f"⚠️ خطا در خواندن CSV:\n{e}")
         traceback.print_exc()
         return
 
-    target_entity = InputPeerChannel(target_group.id, target_group.access_hash)
-    await client.send_message(chat_id, f"شروع اضافه کردن {len(users)} کاربر به گروه: {target_group.title}")
+    if not users:
+        await client.send_message(chat_id, "هیچ کاربری در CSV پیدا نشد.")
+        return
 
-    for idx, user in enumerate(users, start=1):
-        username_or_id = user["username"] or f"id:{user['id']}"
+    total_users = len(users)
+    total_accounts = len(ACCOUNTS_ADD)
+
+    # تقسیم کاربران بین اکانت‌ها (Round Robin)
+    per_account_users = [[] for _ in range(total_accounts)]
+    for idx, user in enumerate(users):
+        acc_index = idx % total_accounts
+        per_account_users[acc_index].append(user)
+
+    await client.send_message(
+        chat_id,
+        f"در حال تقسیم {total_users} کاربر بین {total_accounts} اکانت add و شروع اد همزمان..."
+    )
+
+    # تعریف worker برای هر اکانت
+    async def add_worker(acc, users_for_this_acc):
+        if not users_for_this_acc:
+            return
+
+        name = acc["name"]
+        api_id = acc["api_id"]
+        api_hash = acc["api_hash"]
+        session_string = acc["session_string"]
+
+        session = StringSession(session_string)
+        user_client = TelegramClient(session, api_id, api_hash)
+
         try:
-            await client.send_message(chat_id, f"[{idx}/{len(users)}] در حال اضافه کردن: {username_or_id}")
+            await user_client.connect()
+            if not await user_client.is_user_authorized():
+                await client.send_message(chat_id, f"⚠️ اکانت {name} لاگین نیست، از این اکانت استفاده نشد.")
+                return
 
-            if user["username"]:
-                user_entity = await user_client.get_input_entity(user["username"])
-            else:
-                user_entity = InputPeerUser(user["id"], user["access_hash"])
+            target_entity = InputPeerChannel(target_group.id, target_group.access_hash)
+            total_for_acc = len(users_for_this_acc)
 
-            await user_client(InviteToChannelRequest(target_entity, [user_entity]))
-            await client.send_message(chat_id, f"✅ اضافه شد: {username_or_id}")
+            await client.send_message(
+                chat_id,
+                f"▶️ اکانت {name} شروع کرد. تعداد سهم این اکانت: {total_for_acc} کاربر."
+            )
 
-            # تاخیر بین هر اد
-            if INVITE_DELAY_MODE == "random":
-                delay = random.randint(30, 100)
-            else:
-                delay = INVITE_DELAY
-                if delay < 1:
-                    delay = 1
-            await asyncio.sleep(delay)
+            for idx, user in enumerate(users_for_this_acc, start=1):
+                username_or_id = user["username"] or f"id:{user['id']}"
 
-        except PeerFloodError:
-            await client.send_message(chat_id, "⛔ خطای Flood از سمت تلگرام. روند متوقف شد.")
-            break
-        except UserPrivacyRestrictedError:
-            await client.send_message(chat_id, f"⚠️ محدودیت حریم خصوصی، رد شد: {username_or_id}")
+                try:
+                    await client.send_message(
+                        chat_id,
+                        f"[{name} {idx}/{total_for_acc}] در حال اضافه کردن: {username_or_id}"
+                    )
+
+                    if user["username"]:
+                        user_entity = await user_client.get_input_entity(user["username"])
+                    else:
+                        user_entity = InputPeerUser(user["id"], user["access_hash"])
+
+                    await user_client(InviteToChannelRequest(target_entity, [user_entity]))
+                    await client.send_message(chat_id, f"✅ [{name}] اضافه شد: {username_or_id}")
+
+                except PeerFloodError:
+                    await client.send_message(
+                        chat_id,
+                        f"⛔ [{name}] خطای Flood از سمت تلگرام. این اکانت متوقف شد."
+                    )
+                    break
+                except UserPrivacyRestrictedError:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ [{name}] محدودیت حریم خصوصی، رد شد: {username_or_id}"
+                    )
+                except Exception as e:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ [{name}] خطا برای {username_or_id}:\n{e}"
+                    )
+                    traceback.print_exc()
+
+                # تاخیر مخصوص این اکانت
+                if INVITE_DELAY_MODE == "random":
+                    delay = random.randint(30, 100)
+                else:
+                    delay = INVITE_DELAY
+                    if delay < 1:
+                        delay = 1
+                await asyncio.sleep(delay)
+
+            await client.send_message(chat_id, f"⏹ اکانت {name} کارش تمام شد.")
+
         except Exception as e:
-            await client.send_message(chat_id, f"⚠️ خطا برای {username_or_id}:\n{e}")
+            await client.send_message(chat_id, f"❌ خطای کلی برای اکانت {name}:\n{e}")
             traceback.print_exc()
+        finally:
+            try:
+                await user_client.disconnect()
+            except:
+                pass
 
-    await user_client.disconnect()
-    await client.send_message(chat_id, "پروسه اد کردن کاربران تمام شد.")
+    # ساختن تسک‌ها برای همه اکانت‌ها
+    tasks = []
+    for acc, acc_users in zip(ACCOUNTS_ADD, per_account_users):
+        if acc_users:
+            tasks.append(asyncio.create_task(add_worker(acc, acc_users)))
+
+    if not tasks:
+        await client.send_message(chat_id, "هیچ کاربری بین اکانت‌ها توزیع نشد (لیست خالی بود).")
+        return
+
+    await asyncio.gather(*tasks)
+    await client.send_message(chat_id, "✅ فرآیند add با همه اکانت‌ها تمام شد.")
 
 
 # ------------------ state handler ------------------
@@ -1040,7 +1123,7 @@ async def main_handler(event):
                 "از دکمه‌های زیر برای مدیریت استفاده کن.\n\n"
                 "دستورات تکمیلی:\n"
                 "/accounts  → لیست اکانت‌های add\n"
-                "/useacc <name> → انتخاب اکانت فعال برای add user\n"
+                "/useacc <name> → انتخاب اکانت فعال برای دیدن گروه‌ها\n"
                 "/delacc <name> → حذف اکانت add\n"
                 "/admins → لیست ادمین‌ها\n"
                 "/addadmin <id> /deladmin <id>\n"
@@ -1060,18 +1143,21 @@ async def main_handler(event):
     if not is_admin(user_id):
         return
 
-    # اگر فایل CSV فرستاده شده (برای add user)
+    # اگر فایل Document فرستاده شده (برای CSV add user)
     if event.document:
         file_name = (event.file.name or "").lower()
+
         if ".csv" in file_name:
             await event.reply("فایل CSV دریافت شد، در حال دانلود...")
             try:
                 file_path = await client.download_media(event.document)
-                await event.reply("فایل دانلود شد، شروع اد کردن اعضا...")
+                await event.reply("فایل دانلود شد، شروع اد کردن اعضا با همه اکانت‌های add...")
                 await add_users_from_csv_file(file_path, chat_id)
             except Exception as e:
                 await event.reply(f"خطا در دانلود/پردازش فایل:\n{e}")
                 traceback.print_exc()
+        else:
+            await event.reply("این فایل برای هیچ کاری استفاده نشد. فقط CSV برای add user قابل استفاده است.")
         return
 
     # ------------ دستورات ادمین ------------
@@ -1151,8 +1237,9 @@ async def main_handler(event):
         else:
             lines = ["اکانت‌های add:\n"]
             for acc in ACCOUNTS_ADD:
-                mark = "(active)" if acc["name"] == ACTIVE_ADD_ACCOUNT else ""
+                mark = "(active-for-groups)" if acc["name"] == ACTIVE_ADD_ACCOUNT else ""
                 lines.append(f"- {acc['name']} {mark}  phone: {acc['phone']}")
+            lines.append("\n⚠️ همه‌ی این اکانت‌ها در add از CSV استفاده می‌شوند.")
             await event.reply("\n".join(lines))
         return
 
@@ -1168,7 +1255,7 @@ async def main_handler(event):
             return
         ACTIVE_ADD_ACCOUNT = name
         set_setting("active_add_account", name)
-        await event.reply(f"✅ اکانت فعال برای add user تنظیم شد: {name}")
+        await event.reply(f"✅ اکانت فعال برای گرفتن لیست گروه‌ها تنظیم شد: {name}")
         return
 
     if text.startswith("/delacc"):
@@ -1215,9 +1302,14 @@ async def main_handler(event):
 
     if text == "🧾 گروه‌ها" or text == "/groups":
         if not ACTIVE_ADD_ACCOUNT:
-            await event.reply("هیچ اکانتی برای add user فعال نیست. از منو اکانت اضافه کن یا /useacc بزن.")
+            await event.reply(
+                "هیچ اکانتی برای گرفتن لیست گروه‌ها فعال نیست.\n"
+                "از /useacc <name> استفاده کن یا اکانت add جدید بساز."
+            )
             return
-        await event.reply("در حال گرفتن لیست سوپرگروه‌ها با اکانت فعال (برای add user)...")
+        await event.reply(
+            "در حال گرفتن لیست سوپرگروه‌ها با اکانت فعال (فقط برای انتخاب گروه هدف)..."
+        )
         try:
             await fetch_groups_for_active()
             msg = groups_text()
@@ -1236,7 +1328,11 @@ async def main_handler(event):
             return
         target_group = groups_cache[idx]
         awaiting_group_number = False
-        await event.reply(f"✅ گروه برای add user انتخاب شد:\n{target_group.title}\n(ID: {target_group.id})")
+        await event.reply(
+            f"✅ گروه برای add user انتخاب شد:\n{target_group.title}\n"
+            f"(ID: {target_group.id})\n\n"
+            f"از این به بعد، هنگام ارسال CSV، همه اکانت‌های add روی این گروه کار می‌کنند."
+        )
         return
 
     # ----------- خروج اعضا (export) -----------
