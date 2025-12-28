@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
-from telethon.tl.types import InputPeerEmpty, InputPeerUser, InputPeerChannel
+from telethon.tl.types import InputPeerEmpty, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 from telethon.errors.rpcerrorlist import (
     PeerFloodError,
@@ -46,7 +46,7 @@ INVITE_DELAY = 60              # ثانیه
 INVITE_DELAY_MODE = "fixed"    # fixed یا random
 
 ACCOUNTS_ADD = []              # لیست اکانت‌های add از دیتابیس
-ACTIVE_ADD_ACCOUNT = None      # فقط برای نمایش
+ACTIVE_ADD_ACCOUNT = None      # فقط برای نمایش (سمبلیک)
 
 user_states = {}               # state ماشین برای مکالمه
 login_clients_add = {}         # سشن‌های موقت لاگین add
@@ -70,16 +70,20 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE IF NOT EXISTS admins (user_id BIGINT PRIMARY KEY)")
             cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-            cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
-id BIGSERIAL PRIMARY KEY,
-name TEXT NOT NULL,
-phone TEXT,
-api_id BIGINT NOT NULL,
-api_hash TEXT NOT NULL,
-session_string TEXT NOT NULL,
-kind TEXT NOT NULL CHECK (kind IN ('add', 'export')),
-UNIQUE(name, kind)
-)""")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    phone TEXT,
+                    api_id BIGINT NOT NULL,
+                    api_hash TEXT NOT NULL,
+                    session_string TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('add', 'export')),
+                    UNIQUE(name, kind)
+                )
+                """
+            )
         conn.commit()
 
     load_admins_from_db()
@@ -516,7 +520,12 @@ async def add_users_from_csv_file(file_path, chat_id):
                     )
                     return
 
-                target_entity = InputPeerChannel(target_for_this_acc.id, target_for_this_acc.access_hash)
+                # استفاده از خود entity کانال/گروه (نه InputPeerChannel دستی)
+                try:
+                    target_entity = await user_client.get_entity(target_for_this_acc)
+                except Exception:
+                    target_entity = target_for_this_acc
+
             except Exception as e:
                 await client.send_message(
                     chat_id,
@@ -941,7 +950,6 @@ async def handle_state_message(event, state):
                 await event.reply("عدد تاخیر بین ادها (ثانیه) را بفرست:")
                 return
             elif lower in ("2", "رندوم", "random"):
-                global INVITE_DELAY_MODE
                 INVITE_DELAY_MODE = "random"
                 set_setting("invite_delay_mode", "random")
                 user_states.pop(user_id, None)
@@ -956,11 +964,9 @@ async def handle_state_message(event, state):
             if not text.isdigit():
                 await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
                 return
-            global INVITE_DELAY
             INVITE_DELAY = int(text)
             if INVITE_DELAY < 1:
                 INVITE_DELAY = 1
-            global INVITE_DELAY_MODE
             INVITE_DELAY_MODE = "fixed"
             set_setting("invite_delay", str(INVITE_DELAY))
             set_setting("invite_delay_mode", "fixed")
@@ -985,8 +991,7 @@ async def handle_state_message(event, state):
             name = acc_info["name"]
 
             delete_account_by_id(acc_id)
-            global ACCOUNTS_ADD
-            ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
+            ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
 
             global ACTIVE_ADD_ACCOUNT
             if ACTIVE_ADD_ACCOUNT == name:
@@ -1430,7 +1435,6 @@ async def main_handler(event):
         parts = text.split()
         if len(parts) == 2:
             arg = parts[1].strip().lower()
-            global INVITE_DELAY, INVITE_DELAY_MODE
             if arg.isdigit():
                 INVITE_DELAY = int(arg)
                 if INVITE_DELAY < 1:
@@ -1483,7 +1487,6 @@ async def main_handler(event):
         if not acc:
             await event.reply("اکانت با این نام وجود ندارد.")
             return
-        global ACTIVE_ADD_ACCOUNT
         ACTIVE_ADD_ACCOUNT = name
         set_setting("active_add_account", name)
         await event.reply(f"✅ اکانت فعال (فقط نمایشی) تنظیم شد: {name}")
@@ -1502,9 +1505,7 @@ async def main_handler(event):
             return
         acc_id = acc["id"]
         delete_account_by_id(acc_id)
-        global ACCOUNTS_ADD
-        ACCOUNTS_ADD = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
-        global ACTIVE_ADD_ACCOUNT
+        ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
         if ACTIVE_ADD_ACCOUNT == name:
             ACTIVE_ADD_ACCOUNT = None
             set_setting("active_add_account", "")
