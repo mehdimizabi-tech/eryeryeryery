@@ -496,42 +496,15 @@ async def add_users_from_csv_file(file_path, chat_id):
                 await client.send_message(chat_id, f"⚠️ اکانت {name} لاگین نیست، از این اکانت استفاده نشد.")
                 return
 
-            # با همین اکانت add لیست چت‌ها رو می‌گیریم و گروهی که idش با target_group.id یکیه رو پیدا می‌کنیم
+            # *** مهم: کانال هدف را با همان اکانت add و فقط با id resolve می‌کنیم ***
             try:
-                dialogs = await user_client(GetDialogsRequest(
-                    offset_date=None,
-                    offset_id=0,
-                    offset_peer=InputPeerEmpty(),
-                    limit=200,
-                    hash=0
-                ))
-                chats = dialogs.chats
-                target_for_this_acc = None
-                for ch in chats:
-                    if getattr(ch, "id", None) == target_group.id:
-                        target_for_this_acc = ch
-                        break
-
-                if not target_for_this_acc:
-                    await client.send_message(
-                        chat_id,
-                        f"⚠️ [{name}] نتوانست گروه هدف را در لیست چت‌های خودش پیدا کند.\n"
-                        f"مطمئن شو این اکانت add عضو همان گروهی است که برای add انتخاب کردی."
-                    )
-                    return
-
-                # استفاده از خود entity کانال/گروه (نه InputPeerChannel دستی)
-                try:
-                    target_entity = await user_client.get_entity(target_for_this_acc)
-                except Exception:
-                    target_entity = target_for_this_acc
-
+                target_entity = await user_client.get_input_entity(target_group.id)
             except Exception as e:
                 await client.send_message(
                     chat_id,
-                    f"⚠️ [{name}] خطا در پیدا کردن گروه هدف برای این اکانت:\n{e}"
+                    f"⚠️ [{name}] نتوانست گروه هدف را resolve کند:\n{e}\n"
+                    f"پیشنهاد: با دکمه «👥 جوین اکانت‌ها» مطمئن شو این اکانت عضو گروه شده."
                 )
-                traceback.print_exc()
                 return
 
             total_for_acc = len(users_for_this_acc)
