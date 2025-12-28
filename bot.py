@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
-from telethon.tl.types import InputPeerEmpty, InputPeerChannel, InputPeerUser
+from telethon.tl.types import InputPeerEmpty, InputPeerUser
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 from telethon.errors.rpcerrorlist import (
     PeerFloodError,
@@ -310,27 +310,6 @@ async def send_main_menu(chat_id, text="از منوی زیر استفاده کن
     await client.send_message(chat_id, text, buttons=main_menu())
 
 
-# ------------------ کمک برای add user (قدیمی، فقط نمایشی) ------------------
-
-async def get_add_account_client():
-    """
-    فقط در نسخه قبلی برای گرفتن لیست گروه‌ها از اکانت add استفاده می‌شد.
-    الان برای add از همه ACCOUNTS_ADD استفاده می‌کنیم و گروه‌ها از اکانت export گرفته می‌شوند.
-    """
-    if not ACTIVE_ADD_ACCOUNT:
-        raise RuntimeError("هیچ اکانت فعالی برای add user تنظیم نشده است.")
-    acc = get_add_account_by_name(ACTIVE_ADD_ACCOUNT)
-    if not acc:
-        raise RuntimeError("اکانت فعال در دیتابیس پیدا نشد.")
-
-    session = StringSession(acc["session_string"])
-    user_client = TelegramClient(session, acc["api_id"], acc["api_hash"])
-    await user_client.connect()
-    if not await user_client.is_user_authorized():
-        raise RuntimeError("این اکانت دیگر لاگین نیست (سشن منقضی شده). دوباره اکانت را اضافه کن.")
-    return user_client
-
-
 def sanitize_filename(title: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower())
     return f"members-{safe}.csv"
@@ -357,7 +336,6 @@ def parse_group_link(link: str):
     # الان ممکنه t.me/xxx یا فقط username یا @username باشد
     # اول چک کنیم joinchat
     if "joinchat/" in link:
-        # مثل: t.me/joinchat/XXXX یا telegram.me/joinchat/XXXX
         part = link.split("joinchat/", 1)[1]
         invite_hash = part.split("?", 1)[0]
         return "invite", invite_hash
@@ -562,7 +540,17 @@ async def add_users_from_csv_file(file_path, chat_id):
                 await client.send_message(chat_id, f"⚠️ اکانت {name} لاگین نیست، از این اکانت استفاده نشد.")
                 return
 
-            target_entity = InputPeerChannel(target_group.id, target_group.access_hash)
+            # هر اکانت add خودش گروه هدف را resolve می‌کند
+            try:
+                target_entity = await user_client.get_entity(target_group.id)
+            except Exception as e:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ [{name}] نتوانست گروه هدف را resolve کند:\n{e}\n"
+                    f"این اکانت در فرآیند add استفاده نشد."
+                )
+                return
+
             total_for_acc = len(users_for_this_acc)
 
             await client.send_message(
@@ -732,6 +720,31 @@ async def handle_state_message(event, state):
             await join_all_add_accounts(group_link, chat_id)
             await send_main_menu(chat_id, "کار جوین اکانت‌ها تمام شد. از منو ادامه بده:")
             return
+
+    # ---------- تأیید شروع add از روی CSV ----------
+    if mode == "confirm_add_csv":
+        if step == "confirm":
+            file_path = temp.get("file_path")
+            lower = text.strip().lower()
+            if lower in ["✅ شروع add".lower(), "شروع add", "شروع", "yes", "y"]:
+                user_states.pop(user_id, None)
+                await event.reply("✅ شروع فرآیند add از روی این CSV...")
+                await add_users_from_csv_file(file_path, chat_id)
+                return
+            elif lower in ["❌ انصراف".lower(), "انصراف", "cancel", "لغو"]:
+                user_states.pop(user_id, None)
+                # سعی می‌کنیم فایل را پاک کنیم (اگه وجود داشته باشه)
+                try:
+                    if file_path and os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception:
+                    pass
+                await event.reply("✅ فرآیند add برای این فایل CSV لغو شد.")
+                await send_main_menu(chat_id)
+                return
+            else:
+                await event.reply("برای ادامه، «✅ شروع add» یا «❌ انصراف» را بفرست.")
+                return
 
     # ---------- افزودن اکانت add با لاگین کد + 2FA ----------
     if mode == "addacc":
@@ -1360,8 +1373,18 @@ async def main_handler(event):
             await event.reply("فایل CSV دریافت شد، در حال دانلود...")
             try:
                 file_path = await client.download_media(event.document)
-                await event.reply("فایل دانلود شد، شروع اد کردن اعضا با همه اکانت‌های add...")
-                await add_users_from_csv_file(file_path, chat_id)
+                # بعد از دانلود، نیاز به تأیید کاربر داریم
+                user_states[user_id] = {
+                    "mode": "confirm_add_csv",
+                    "step": "confirm",
+                    "temp": {"file_path": file_path},
+                }
+                await event.reply(
+                    "فایل CSV دانلود شد.\n"
+                    "اگر می‌خواهی فرآیند add روی این فایل شروع شود، «✅ شروع add» را بفرست.\n"
+                    "اگر منصرف شدی، «❌ انصراف» را بفرست.",
+                    buttons=[[Button.text("✅ شروع add"), Button.text("❌ انصراف")]]
+                )
             except Exception as e:
                 await event.reply(f"خطا در دانلود/پردازش فایل:\n{e}")
                 traceback.print_exc()
