@@ -504,7 +504,7 @@ async def add_users_from_csv_file(file_path, chat_id):
                 await client.send_message(chat_id, f"⚠️ اکانت {name} لاگین نیست، از این اکانت استفاده نشد.")
                 return
 
-            # مهم: استفاده مستقیم از InputPeerChannel
+            # استفاده مستقیم از InputPeerChannel
             target_entity = InputPeerChannel(target_group.id, target_group.access_hash)
 
             total_for_acc = len(users_for_this_acc)
@@ -532,7 +532,6 @@ async def add_users_from_csv_file(file_path, chat_id):
                         user_entity = InputPeerUser(user["id"], user["access_hash"])
 
                     await user_client(InviteToChannelRequest(target_entity, [user_entity]))
-
                     await client.send_message(chat_id, f"✅ [{name}] اضافه شد: {username_or_id}")
 
                 except PeerFloodError:
@@ -1297,10 +1296,10 @@ async def main_handler(event):
     # اولین بار ادمین شدن
     if text == "/setmeadmin":
         if ADMINS and user_id not in ADMINS:
-            await event.reply("ادمین قبلاً تعریف شده. فقط اdmین‌ها می‌توانند اdmین جدید اضافه کنند.")
+            await event.reply("ادمین قبلاً تعریف شده. فقط ادمین‌ها می‌توانند ادمین جدید اضافه کنند.")
             return
         add_admin_db(user_id)
-        await event.reply("✅ شما به عنوان اdmین ثبت شدید.")
+        await event.reply("✅ شما به عنوان ادمین ثبت شدید.")
         await send_main_menu(chat_id)
         return
 
@@ -1308,13 +1307,13 @@ async def main_handler(event):
     if text == "/start":
         if is_admin(user_id):
             await event.reply(
-                "سلام اdmین 👋\n"
+                "سلام ادمین 👋\n"
                 "از دکمه‌های زیر برای مدیریت استفاده کن.\n\n"
                 "دستورات تکمیلی:\n"
                 "/accounts  → لیست اکانت‌های add\n"
                 "/useacc <name> → فقط برای علامت‌گذاری اکانت فعال (نمایشی)\n"
                 "/delacc <name> → حذف اکانت add\n"
-                "/admins → لیست اdmین‌ها\n"
+                "/admins → لیست ادمین‌ها\n"
                 "/addadmin <id> /deladmin <id>\n"
                 "/setdelay <sec|random> → تاخیر اد از CSV",
             )
@@ -1323,12 +1322,12 @@ async def main_handler(event):
             await event.reply(
                 "سلام 👋\n"
                 "برای دیدن آی‌دی عددی خودت:\n`/me`\n\n"
-                "اگر اولین بار استارت می‌کنی و اdmینی تعریف نشده:\n`/setmeadmin` را بزن.",
+                "اگر اولین بار استارت می‌کنی و ادمینی تعریف نشده:\n`/setmeadmin` را بزن.",
                 parse_mode="markdown"
             )
         return
 
-    # غیر اdmین هیچ کاری نکند
+    # غیر ادمین هیچ کاری نکند
     if not is_admin(user_id):
         return
 
@@ -1370,13 +1369,13 @@ async def main_handler(event):
             )
         return
 
-    # مدیریت اdmین‌ها
+    # مدیریت ادمین‌ها
     if text == "/admins":
         if not ADMINS:
-            await event.reply("هیچ اdmینی ثبت نشده.")
+            await event.reply("هیچ ادمینی ثبت نشده.")
         else:
             ids_text = "\n".join(str(a) for a in ADMINS)
-            await event.reply(f"لیست اdmین‌ها (آی‌دی عددی):\n{ids_text}")
+            await event.reply(f"لیست ادمین‌ها (آی‌دی عددی):\n{ids_text}")
         return
 
     if text.startswith("/addadmin"):
@@ -1386,7 +1385,7 @@ async def main_handler(event):
             return
         new_id = int(parts[1])
         add_admin_db(new_id)
-        await event.reply(f"✅ اdmین جدید اضافه شد: `{new_id}`", parse_mode="markdown")
+        await event.reply(f"✅ ادمین جدید اضافه شد: `{new_id}`", parse_mode="markdown")
         return
 
     if text.startswith("/deladmin"):
@@ -1397,9 +1396,9 @@ async def main_handler(event):
         rem_id = int(parts[1])
         if rem_id in ADMINS:
             remove_admin_db(rem_id)
-            await event.reply(f"✅ اdmین حذف شد: `{rem_id}`", parse_mode="markdown")
+            await event.reply(f"✅ ادمین حذف شد: `{rem_id}`", parse_mode="markdown")
         else:
-            await event.reply("این آی‌دی جزو اdmین‌ها نیست.")
+            await event.reply("این آی‌دی جزو ادمین‌ها نیست.")
         return
 
     # /setdelay
@@ -1546,7 +1545,7 @@ async def main_handler(event):
         return
 
     # دکمه خروج اعضا
-    if text == "📤 خروج اعضا" یا text == "/export":
+    if text == "📤 خروج اعضا" or text == "/export":
         accounts = get_export_accounts()
         if not accounts:
             user_states[user_id] = {"mode": "export_login", "step": "name", "temp": {}}
