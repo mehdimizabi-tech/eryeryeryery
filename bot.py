@@ -17,6 +17,7 @@ from telethon.errors.rpcerrorlist import (
     PeerFloodError,
     UserPrivacyRestrictedError,
     UserAlreadyParticipantError,
+    ChannelInvalidError,
 )
 from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
@@ -51,8 +52,11 @@ user_states = {}                # state ماشین برای هر یوزر
 login_clients_add = {}          # سشن‌های موقت برای لاگین اکانت‌های add
 login_clients_export = {}       # سشن‌های موقت برای لاگین اکانت‌های export
 
-groups_cache = []               # کش گروه‌ها بعد از /🧾 شروع add
-target_group = None             # گروه انتخاب شده برای add
+groups_cache = []               # کش گروه‌ها بعد از 🧾 شروع add
+target_group = None             # آبجکت گروه انتخاب شده (از اکانت export)
+target_group_id = None          # chat_id گروه
+target_group_username = None    # @username اگر عمومی باشه
+target_group_title = None       # اسم گروه برای لاگ‌ها
 awaiting_group_number = False   # اگر True یعنی منتظر شماره گروه هستیم
 
 current_add_jobs = {}           # برای کنترل استاپ add به ازای هر چت
@@ -281,9 +285,9 @@ def sanitize_filename(title: str) -> str:
 def parse_group_link(link: str):
     link = link.strip()
     if link.startswith("https://"):
-        link = link[len("https://") :]
+        link = link[len("https://"):]
     elif link.startswith("http://"):
-        link = link[len("http://") :]
+        link = link[len("http://"):]
 
     if "joinchat/" in link:
         part = link.split("joinchat/", 1)[1]
@@ -296,7 +300,7 @@ def parse_group_link(link: str):
         return "invite", invite_hash
 
     if link.startswith("t.me/"):
-        after = link[len("t.me/") :]
+        after = link[len("t.me/"):]
     else:
         after = link
 
@@ -406,7 +410,8 @@ async def join_all_add_accounts(group_link: str, chat_id: int):
 
 # ------------ ADD از روی CSV با تقسیم بین همه اکانت‌های add ------------
 async def add_users_from_csv_file(file_path, chat_id: int):
-    global target_group, current_add_jobs
+    global target_group, target_group_id, target_group_username, target_group_title
+    global current_add_jobs
 
     if not ACCOUNTS_ADD:
         await client.send_message(
@@ -415,7 +420,7 @@ async def add_users_from_csv_file(file_path, chat_id: int):
         )
         return
 
-    if target_group is None:
+    if target_group is None or target_group_id is None:
         await client.send_message(
             chat_id,
             "هیچ گروهی برای add user انتخاب نشده. از دکمه 🧾 شروع add استفاده کن.",
@@ -490,17 +495,35 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                 )
                 return
 
-            # *** اینجا مهمه: کانال هدف با همین اکانت resolve می‌شه ***
+            # ---- اینجا کانال را برای همین سشن resolve می‌کنیم ----
+            target_entity = None
             try:
-                channel_input = InputPeerChannel(target_group.id, target_group.access_hash)
-                target_entity = await user_client.get_entity(channel_input)
+                if target_group_username:
+                    # اگر گروه public است
+                    target_entity = await user_client.get_entity(target_group_username)
+                else:
+                    # اگر private است و فقط id داریم
+                    target_entity = await user_client.get_entity(target_group_id)
             except Exception as e:
-                await client.send_message(
-                    chat_id,
-                    f"⚠️ [{name}] نتوانست کانال هدف را resolve کند:\n{e}\n"
-                    "پیشنهاد: با دکمه «👥 جوین اکانت‌ها» مطمئن شو این اکانت عضو گروه شده.",
-                )
-                return
+                # fallback: تلاش با InputPeerChannel
+                try:
+                    channel_input = InputPeerChannel(target_group_id, target_group.access_hash)
+                    target_entity = await user_client.get_entity(channel_input)
+                except Exception as e2:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ [{name}] نتوانست کانال هدف را resolve کند:\n"
+                        f"{e2}\n"
+                        "پیشنهاد: با دکمه «👥 جوین اکانت‌ها» مطمئن شو این اکانت عضو گروه شده "
+                        "و سپس دوباره فرآیند add را شروع کن.",
+                    )
+                    return
+
+            await client.send_message(
+                chat_id,
+                f"ℹ️ [{name}] کانال هدف برای این اکانت resolve شد: "
+                f"{getattr(target_entity, 'title', target_group_title)} (id={getattr(target_entity, 'id', 'unknown')})"
+            )
 
             total_for_acc = len(users_for_this_acc)
             await client.send_message(
@@ -546,6 +569,15 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                         chat_id,
                         f"⚠️ [{name}] محدودیت حریم خصوصی، رد شد: {username_or_id}",
                     )
+                except ChannelInvalidError as e:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ [{name}] خطای کانال نامعتبر (ChannelInvalidError) برای {username_or_id}:\n"
+                        f"{e}\n"
+                        "این یعنی این اکانت از دید تلگرام دسترسی معتبر به کانال هدف ندارد.\n"
+                        "پیشنهاد: از «👥 جوین اکانت‌ها» استفاده کن و مطمئن شو این اکانت عضو همون گروهه.",
+                    )
+                    break
                 except Exception as e:
                     await client.send_message(
                         chat_id,
@@ -611,6 +643,7 @@ async def add_users_from_csv_file(file_path, chat_id: int):
 async def handle_state_message(event, state):
     global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD, INVITE_DELAY_MODE
     global groups_cache, awaiting_group_number, target_group
+    global target_group_id, target_group_username, target_group_title
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -1347,8 +1380,10 @@ async def handle_state_message(event, state):
 # ------------ هندل اصلی پیام‌ها ------------
 @client.on(events.NewMessage)
 async def main_handler(event):
-    global awaiting_group_number, target_group, ACTIVE_ADD_ACCOUNT
-    global INVITE_DELAY, ACCOUNTS_ADD, INVITE_DELAY_MODE, current_add_jobs
+    global awaiting_group_number, target_group, target_group_id
+    global target_group_username, target_group_title
+    global ACTIVE_ADD_ACCOUNT, INVITE_DELAY, ACCOUNTS_ADD, INVITE_DELAY_MODE
+    global current_add_jobs
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -1654,12 +1689,15 @@ async def main_handler(event):
                 "شماره گروه نامعتبر است. دوباره دکمه 🧾 شروع add را بزن."
             )
             return
-        global target_group
-        target_group = groups_cache[idx]
+        target = groups_cache[idx]
+        target_group = target
+        target_group_id = target.id
+        target_group_username = getattr(target, "username", None)
+        target_group_title = getattr(target, "title", "گروه")
         awaiting_group_number = False
         await event.reply(
-            f"✅ گروه برای add user انتخاب شد:\n{target_group.title}\n"
-            f"(ID: {target_group.id})\n\n"
+            f"✅ گروه برای add user انتخاب شد:\n{target_group_title}\n"
+            f"(ID: {target_group_id})\n\n"
             f"حالا فایل CSV را بفرست تا با همه اکانت‌های add روی این گروه add انجام شود."
         )
         return
