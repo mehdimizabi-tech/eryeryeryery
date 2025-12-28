@@ -825,7 +825,7 @@ async def handle_state_message(event, state):
                     "session_string": session_string,
                 })
 
-                global ACTIVE_ADD_ACCOUNT
+                # دیگه global دوباره نداریم، از global بالای تابع استفاده می‌کنیم
                 if not ACTIVE_ADD_ACCOUNT:
                     ACTIVE_ADD_ACCOUNT = name
                     set_setting("active_add_account", name)
@@ -892,7 +892,6 @@ async def handle_state_message(event, state):
                     "session_string": session_string,
                 })
 
-                global ACTIVE_ADD_ACCOUNT
                 if not ACTIVE_ADD_ACCOUNT:
                     ACTIVE_ADD_ACCOUNT = name
                     set_setting("active_add_account", name)
@@ -966,7 +965,6 @@ async def handle_state_message(event, state):
             delete_account_by_id(acc_id)
             ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
 
-            global ACTIVE_ADD_ACCOUNT
             if ACTIVE_ADD_ACCOUNT == name:
                 ACTIVE_ADD_ACCOUNT = None
                 set_setting("active_add_account", "")
