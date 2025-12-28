@@ -495,7 +495,7 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                 )
                 return
 
-            # ---- اینجا کانال را برای همین سشن resolve می‌کنیم ----
+            # ---- کانال را برای همین سشن resolve می‌کنیم ----
             target_entity = None
             try:
                 if target_group_username:
@@ -504,7 +504,7 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                 else:
                     # اگر private است و فقط id داریم
                     target_entity = await user_client.get_entity(target_group_id)
-            except Exception as e:
+            except Exception:
                 # fallback: تلاش با InputPeerChannel
                 try:
                     channel_input = InputPeerChannel(target_group_id, target_group.access_hash)
@@ -872,7 +872,6 @@ async def handle_state_message(event, state):
                     }
                 )
 
-                global ACTIVE_ADD_ACCOUNT
                 if not ACTIVE_ADD_ACCOUNT:
                     ACTIVE_ADD_ACCOUNT = name
                     set_setting("active_add_account", name)
@@ -948,7 +947,6 @@ async def handle_state_message(event, state):
                     }
                 )
 
-                global ACTIVE_ADD_ACCOUNT
                 if not ACTIVE_ADD_ACCOUNT:
                     ACTIVE_ADD_ACCOUNT = name
                     set_setting("active_add_account", name)
@@ -996,7 +994,6 @@ async def handle_state_message(event, state):
             if not text.isdigit():
                 await event.reply("تاخیر باید عدد (ثانیه) باشد. دوباره بفرست:")
                 return
-            global INVITE_DELAY, INVITE_DELAY_MODE
             INVITE_DELAY = int(text)
             if INVITE_DELAY < 1:
                 INVITE_DELAY = 1
@@ -1027,7 +1024,6 @@ async def handle_state_message(event, state):
         delete_account_by_id(acc_id)
         ACCOUNTS_ADD[:] = [a for a in ACCOUNTS_ADD if a["id"] != acc_id]
 
-        global ACTIVE_ADD_ACCOUNT
         if ACTIVE_ADD_ACCOUNT == name:
             ACTIVE_ADD_ACCOUNT = None
             set_setting("active_add_account", "")
@@ -1526,9 +1522,10 @@ async def main_handler(event):
         if len(parts) == 2:
             arg = parts[1].strip().lower()
             if arg.isdigit():
-                INVITE_DELAY = int(arg)
-                if INVITE_DELAY < 1:
-                    INVITE_DELAY = 1
+                delay = int(arg)
+                if delay < 1:
+                    delay = 1
+                INVITE_DELAY = delay
                 INVITE_DELAY_MODE = "fixed"
                 set_setting("invite_delay", str(INVITE_DELAY))
                 set_setting("invite_delay_mode", "fixed")
