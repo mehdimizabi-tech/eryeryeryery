@@ -1382,7 +1382,7 @@ async def handle_state_message(event, state):
             traceback.print_exc()
         return
 
-    # ====== گرفتن اعضای گروه بر اساس کسانی که پیام داده‌اند ======
+    # ====== گرفتن اعضای گروه بر اساس کسانی که پیام داده‌اند (فقط از روی پیام‌ها) ======
     if mode == "export_chat_active" and step == "chat_id":
         try:
             chat_id_val = int(text)
@@ -1418,17 +1418,24 @@ async def handle_state_message(event, state):
 
             await event.reply(
                 "در حال اسکن پیام‌ها برای پیدا کردن کاربران فعال...\n"
-                "این کار ممکن است کمی طول بکشد (بسته به حجم چت)."
+                "این کار ممکن است با توجه به تعداد پیام‌ها کمی طول بکشد."
             )
 
-            active_ids = set()
+            # sender_id -> User
+            active_users = {}
             async for msg in exp_client.iter_messages(entity):
-                if msg.sender_id:
-                    active_ids.add(msg.sender_id)
-
-            participants = await exp_client.get_participants(
-                entity, aggressive=True
-            )
+                sid = msg.sender_id
+                if not sid:
+                    continue
+                if sid in active_users:
+                    continue
+                try:
+                    sender = await msg.get_sender()
+                except Exception:
+                    continue
+                if not sender:
+                    continue
+                active_users[sid] = sender
 
             buffer = io.StringIO()
             writer = csv.writer(buffer, delimiter=",", lineterminator="\n")
@@ -1436,22 +1443,21 @@ async def handle_state_message(event, state):
                 ["username", "user_id", "access_hash", "name", "group", "group_id"]
             )
 
-            seen_ids = set()
             count = 0
-            for u in participants:
-                if u.id not in active_ids:
+            for uid, u in active_users.items():
+                if not hasattr(u, "id"):
                     continue
-                if u.id in seen_ids:
-                    continue
-                seen_ids.add(u.id)
                 name = " ".join(
-                    filter(None, [u.first_name, u.last_name])
+                    filter(
+                        None,
+                        [getattr(u, "first_name", None), getattr(u, "last_name", None)],
+                    )
                 )
                 writer.writerow(
                     [
-                        u.username or "",
+                        getattr(u, "username", "") or "",
                         u.id,
-                        u.access_hash,
+                        getattr(u, "access_hash", 0) or 0,
                         name,
                         getattr(entity, "title", "chat"),
                         chat_id_val,
@@ -1469,7 +1475,7 @@ async def handle_state_message(event, state):
                 chat_id,
                 csv_bytes,
                 filename=filename,
-                caption=f"تعداد اعضای فعال (پیام‌داده): {count}",
+                caption=f"تعداد کاربران فعال (حداقل یک پیام): {count}",
             )
 
             await exp_client.disconnect()
