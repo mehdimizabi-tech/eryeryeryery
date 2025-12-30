@@ -10,14 +10,16 @@ import psycopg
 from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
+from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerUser, InputPeerChannel
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors.rpcerrorlist import (
     PeerFloodError,
     UserPrivacyRestrictedError,
     UserAlreadyParticipantError,
     ChannelInvalidError,
+    UserIdInvalidError,
 )
 from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
@@ -546,16 +548,40 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                         f"[{name} {idx}/{total_for_acc}] در حال اضافه کردن: {username_or_id}",
                     )
 
+                    # --- اینجا منطق ساخت user_entity بهتر شده ---
                     if user["username"]:
+                        # اگر یوزرنیم داریم، از همون استفاده می‌کنیم
                         user_entity = await user_client.get_input_entity(user["username"])
                     else:
-                        user_entity = InputPeerUser(user["id"], user["access_hash"])
+                        # یوزرنیم نداریم؛ می‌ریم سراغ id / access_hash
+                        if user["id"] and user["access_hash"]:
+                            # id + access_hash کامل → همان رفتار قدیم
+                            user_entity = InputPeerUser(user["id"], user["access_hash"])
+                        elif user["id"]:
+                            # access_hash خالی/۰ است، ولی id داریم → تلاش با get_entity(id)
+                            try:
+                                entity = await user_client.get_entity(user["id"])
+                                user_entity = entity
+                            except Exception as e_res:
+                                await client.send_message(
+                                    chat_id,
+                                    f"⚠️ [{name}] نتوانست یوزر با id {user['id']} را resolve کند:\n"
+                                    f"{e_res}\n"
+                                    "این کاربر رد شد.",
+                                )
+                                continue
+                        else:
+                            await client.send_message(
+                                chat_id,
+                                f"⚠️ [{name}] رکورد نامعتبر بدون username و id، رد شد.",
+                            )
+                            continue
 
                     await user_client(
                         InviteToChannelRequest(target_entity, [user_entity])
                     )
                     await client.send_message(
-                        chat_id, f"✅ [{name}] اضافه شد: {username_or_id}"
+                        chat_id, f"✅ [{name}] درخواست add برای {username_or_id} بدون ارور ارسال شد."
                     )
 
                 except PeerFloodError:
@@ -568,6 +594,13 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                     await client.send_message(
                         chat_id,
                         f"⚠️ [{name}] محدودیت حریم خصوصی، رد شد: {username_or_id}",
+                    )
+                except UserIdInvalidError as e_uid:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ [{name}] UserIdInvalid برای {username_or_id}:\n"
+                        f"{e_uid}\n"
+                        "این کاربر رد شد.",
                     )
                 except ChannelInvalidError as e:
                     await client.send_message(
@@ -1033,7 +1066,7 @@ async def handle_state_message(event, state):
         await send_main_menu(chat_id)
         return
 
-    # ====== انتخاب اکانت export برای خروج اعضا ======
+    # ====== انتخاب اکانت export (مرحله اول خروج اعضا) ======
     if mode == "export_select" and step == "choose":
         accounts = temp.get("accounts", [])
         lower = text.lower()
@@ -1062,13 +1095,54 @@ async def handle_state_message(event, state):
 
         acc_id = accounts[idx]["id"]
         temp2 = {"account_id": acc_id}
+        # این‌جا می‌ریم سراغ انتخاب نوع خروج اعضا
         user_states[user_id] = {
-            "mode": "export_chat",
-            "step": "chat_id",
+            "mode": "export_mode",
+            "step": "choose",
             "temp": temp2,
         }
-        await event.reply("حالا chat_id گروه را بفرست (مثلاً -1001234567890):")
+        await event.reply(
+            "کدام نوع خروج اعضا را می‌خواهی؟\n"
+            "1️⃣ خروج کامل همه اعضای گروه\n"
+            "2️⃣ فقط کسانی که در گروه پیام ارسال کرده‌اند\n\n"
+            "فقط 1 یا 2 را بفرست."
+        )
         return
+
+    # ====== انتخاب نوع خروج اعضا (کامل / فعال‌ها) ======
+    if mode == "export_mode" and step == "choose":
+        choice = text.strip()
+        acc_id = temp.get("account_id")
+        if choice in ("1", "۱", "all", "members"):
+            temp2 = {"account_id": acc_id}
+            user_states[user_id] = {
+                "mode": "export_chat",
+                "step": "chat_id",
+                "temp": temp2,
+            }
+            await event.reply(
+                "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست (مثلاً -1001234567890):"
+            )
+            return
+        elif choice in ("2", "۲", "active"):
+            temp2 = {"account_id": acc_id}
+            user_states[user_id] = {
+                "mode": "export_chat_active",
+                "step": "chat_id",
+                "temp": temp2,
+            }
+            await event.reply(
+                "حالا chat_id گروهی که می‌خوای فقط اعضای **فعال** (کسانی که پیام داده‌اند) رو بگیرم بفرست (مثلاً -1001234567890):",
+                parse_mode="markdown",
+            )
+            return
+        else:
+            await event.reply(
+                "فقط 1 یا 2 را بفرست:\n"
+                "1️⃣ خروج کامل همه اعضای گروه\n"
+                "2️⃣ فقط کسانی که پیام داده‌اند."
+            )
+            return
 
     # ====== ویزارد لاگین اکانت export ======
     if mode == "export_login":
@@ -1166,13 +1240,16 @@ async def handle_state_message(event, state):
 
                 temp2 = {"account_id": acc_id}
                 user_states[user_id] = {
-                    "mode": "export_chat",
-                    "step": "chat_id",
+                    "mode": "export_mode",
+                    "step": "choose",
                     "temp": temp2,
                 }
                 await event.reply(
                     f"✅ اکانت export `{name}` لاگین شد.\n"
-                    "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست:",
+                    "حالا نوع خروج اعضا را انتخاب کن:\n"
+                    "1️⃣ خروج کامل همه اعضای گروه\n"
+                    "2️⃣ فقط کسانی که پیام داده‌اند\n\n"
+                    "فقط 1 یا 2 را بفرست.",
                     parse_mode="markdown",
                 )
 
@@ -1231,13 +1308,16 @@ async def handle_state_message(event, state):
 
                 temp2 = {"account_id": acc_id}
                 user_states[user_id] = {
-                    "mode": "export_chat",
-                    "step": "chat_id",
+                    "mode": "export_mode",
+                    "step": "choose",
                     "temp": temp2,
                 }
                 await event.reply(
                     f"✅ اکانت export `{name}` (با 2FA) لاگین شد.\n"
-                    "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست:",
+                    "حالا نوع خروج اعضا را انتخاب کن:\n"
+                    "1️⃣ خروج کامل همه اعضای گروه\n"
+                    "2️⃣ فقط کسانی که پیام داده‌اند\n\n"
+                    "فقط 1 یا 2 را بفرست.",
                     parse_mode="markdown",
                 )
             except Exception as e:
@@ -1250,7 +1330,7 @@ async def handle_state_message(event, state):
                 user_states.pop(user_id, None)
             return
 
-    # ====== گرفتن اعضای گروه با اکانت export ======
+    # ====== خروج اعضا بر اساس همه‌ی اعضای گروه ======
     if mode == "export_chat" and step == "chat_id":
         try:
             chat_id_val = int(text)
@@ -1292,7 +1372,13 @@ async def handle_state_message(event, state):
             writer.writerow(
                 ["username", "user_id", "access_hash", "name", "group", "group_id"]
             )
+
+            seen_ids = set()
+            count = 0
             for u in participants:
+                if u.id in seen_ids:
+                    continue
+                seen_ids.add(u.id)
                 name = " ".join(
                     filter(None, [u.first_name, u.last_name])
                 )
@@ -1306,6 +1392,7 @@ async def handle_state_message(event, state):
                         chat_id_val,
                     ]
                 )
+                count += 1
 
             csv_bytes = buffer.getvalue().encode("utf-8")
             buffer.close()
@@ -1315,7 +1402,7 @@ async def handle_state_message(event, state):
                 chat_id,
                 csv_bytes,
                 filename=filename,
-                caption=f"تعداد اعضا: {len(participants)}",
+                caption=f"تعداد اعضا: {count}",
             )
 
             await exp_client.disconnect()
@@ -1326,6 +1413,107 @@ async def handle_state_message(event, state):
 
         except Exception as e:
             await event.reply(f"خطا در گرفتن اعضای گروه:\n{e}")
+            traceback.print_exc()
+        return
+
+    # ====== خروج اعضا بر اساس کسانی که پیام داده‌اند ======
+    if mode == "export_chat_active" and step == "chat_id":
+        try:
+            chat_id_val = int(text)
+        except ValueError:
+            await event.reply(
+                "chat_id باید عدد باشد. مثلاً -1001234567890"
+            )
+            return
+
+        acc_id = temp.get("account_id")
+        row = get_account_row_by_id(acc_id)
+        if not row:
+            await event.reply("اکانت export در دیتابیس یافت نشد.")
+            user_states.pop(user_id, None)
+            return
+
+        session_string = row["session_string"]
+        api_id = row["api_id"]
+        api_hash = row["api_hash"]
+
+        exp_client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        try:
+            await exp_client.connect()
+            if not await exp_client.is_user_authorized():
+                await event.reply(
+                    "این اکانت export دیگر لاگین نیست. مجدداً آن را بساز."
+                )
+                await exp_client.disconnect()
+                user_states.pop(user_id, None)
+                return
+
+            entity = await exp_client.get_entity(chat_id_val)
+
+            await event.reply(
+                "در حال اسکن پیام‌ها برای پیدا کردن کاربران فعال...\n"
+                "این کار ممکن است کمی طول بکشد (بسته به حجم چت)."
+            )
+
+            active_ids = set()
+            async for msg in exp_client.iter_messages(entity):
+                if msg.sender_id:
+                    active_ids.add(msg.sender_id)
+
+            participants = await exp_client.get_participants(
+                entity, aggressive=True
+            )
+
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, delimiter=",", lineterminator="\n")
+            writer.writerow(
+                ["username", "user_id", "access_hash", "name", "group", "group_id"]
+            )
+
+            seen_ids = set()
+            count = 0
+            for u in participants:
+                if u.id not in active_ids:
+                    continue
+                if u.id in seen_ids:
+                    continue
+                seen_ids.add(u.id)
+                name = " ".join(
+                    filter(None, [u.first_name, u.last_name])
+                )
+                writer.writerow(
+                    [
+                        u.username or "",
+                        u.id,
+                        u.access_hash,
+                        name,
+                        getattr(entity, "title", "chat"),
+                        chat_id_val,
+                    ]
+                )
+                count += 1
+
+            csv_bytes = buffer.getvalue().encode("utf-8")
+            buffer.close()
+
+            filename = sanitize_filename(
+                getattr(entity, "title", "chat") + "-active"
+            ) + ".csv"
+            await client.send_file(
+                chat_id,
+                csv_bytes,
+                filename=filename,
+                caption=f"تعداد اعضای فعال (پیام‌داده): {count}",
+            )
+
+            await exp_client.disconnect()
+            user_states.pop(user_id, None)
+            await send_main_menu(
+                chat_id, "خروج اعضای فعال انجام شد. از منو ادامه بده:"
+            )
+
+        except Exception as e:
+            await event.reply(f"خطا در گرفتن اعضای فعال گروه:\n{e}")
             traceback.print_exc()
         return
 
@@ -1525,6 +1713,7 @@ async def main_handler(event):
                 delay = int(arg)
                 if delay < 1:
                     delay = 1
+                global INVITE_DELAY, INVITE_DELAY_MODE
                 INVITE_DELAY = delay
                 INVITE_DELAY_MODE = "fixed"
                 set_setting("invite_delay", str(INVITE_DELAY))
@@ -1594,6 +1783,7 @@ async def main_handler(event):
         if not acc:
             await event.reply("اکانت با این نام وجود ندارد.")
             return
+        global ACTIVE_ADD_ACCOUNT
         ACTIVE_ADD_ACCOUNT = name
         set_setting("active_add_account", name)
         await event.reply(f"✅ اکانت فعال (فقط نمایشی) تنظیم شد: {name}")
@@ -1687,6 +1877,7 @@ async def main_handler(event):
             )
             return
         target = groups_cache[idx]
+        global target_group, target_group_id, target_group_username, target_group_title
         target_group = target
         target_group_id = target.id
         target_group_username = getattr(target, "username", None)
@@ -1725,7 +1916,7 @@ async def main_handler(event):
         for i, a in enumerate(accounts):
             lines.append(f"{i}: {a['name']}  phone: {a['phone']}")
         lines.append(
-            '\nیک عدد برای انتخاب اکانت بفرست، یا عبارت "new" برای ساخت اکانت جدید:'
+            '\nیک عدد برای انتخاب اکانت بفرست، یا عبارت "new" برای ساخت اکانت جدید بفرست:'
         )
         await event.reply("\n".join(lines))
         return
