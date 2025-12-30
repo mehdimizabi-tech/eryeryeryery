@@ -10,16 +10,14 @@ import psycopg
 from psycopg.rows import dict_row
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
 from telethon.tl.types import InputPeerEmpty, InputPeerUser, InputPeerChannel
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors.rpcerrorlist import (
     PeerFloodError,
     UserPrivacyRestrictedError,
     UserAlreadyParticipantError,
     ChannelInvalidError,
-    UserIdInvalidError,
 )
 from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
@@ -548,40 +546,16 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                         f"[{name} {idx}/{total_for_acc}] در حال اضافه کردن: {username_or_id}",
                     )
 
-                    # --- اینجا منطق ساخت user_entity بهتر شده ---
                     if user["username"]:
-                        # اگر یوزرنیم داریم، از همون استفاده می‌کنیم
                         user_entity = await user_client.get_input_entity(user["username"])
                     else:
-                        # یوزرنیم نداریم؛ می‌ریم سراغ id / access_hash
-                        if user["id"] and user["access_hash"]:
-                            # id + access_hash کامل → همان رفتار قدیم
-                            user_entity = InputPeerUser(user["id"], user["access_hash"])
-                        elif user["id"]:
-                            # access_hash خالی/۰ است، ولی id داریم → تلاش با get_entity(id)
-                            try:
-                                entity = await user_client.get_entity(user["id"])
-                                user_entity = entity
-                            except Exception as e_res:
-                                await client.send_message(
-                                    chat_id,
-                                    f"⚠️ [{name}] نتوانست یوزر با id {user['id']} را resolve کند:\n"
-                                    f"{e_res}\n"
-                                    "این کاربر رد شد.",
-                                )
-                                continue
-                        else:
-                            await client.send_message(
-                                chat_id,
-                                f"⚠️ [{name}] رکورد نامعتبر بدون username و id، رد شد.",
-                            )
-                            continue
+                        user_entity = InputPeerUser(user["id"], user["access_hash"])
 
                     await user_client(
                         InviteToChannelRequest(target_entity, [user_entity])
                     )
                     await client.send_message(
-                        chat_id, f"✅ [{name}] درخواست add برای {username_or_id} بدون ارور ارسال شد."
+                        chat_id, f"✅ [{name}] اضافه شد: {username_or_id}"
                     )
 
                 except PeerFloodError:
@@ -594,13 +568,6 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                     await client.send_message(
                         chat_id,
                         f"⚠️ [{name}] محدودیت حریم خصوصی، رد شد: {username_or_id}",
-                    )
-                except UserIdInvalidError as e_uid:
-                    await client.send_message(
-                        chat_id,
-                        f"⚠️ [{name}] UserIdInvalid برای {username_or_id}:\n"
-                        f"{e_uid}\n"
-                        "این کاربر رد شد.",
                     )
                 except ChannelInvalidError as e:
                     await client.send_message(
@@ -1066,7 +1033,7 @@ async def handle_state_message(event, state):
         await send_main_menu(chat_id)
         return
 
-    # ====== انتخاب اکانت export (مرحله اول خروج اعضا) ======
+    # ====== انتخاب اکانت export برای خروج اعضا ======
     if mode == "export_select" and step == "choose":
         accounts = temp.get("accounts", [])
         lower = text.lower()
@@ -1095,7 +1062,6 @@ async def handle_state_message(event, state):
 
         acc_id = accounts[idx]["id"]
         temp2 = {"account_id": acc_id}
-        # این‌جا می‌ریم سراغ انتخاب نوع خروج اعضا
         user_states[user_id] = {
             "mode": "export_mode",
             "step": "choose",
@@ -1121,7 +1087,7 @@ async def handle_state_message(event, state):
                 "temp": temp2,
             }
             await event.reply(
-                "حالا chat_id گروهی که می‌خوای اعضاش رو بگیری بفرست (مثلاً -1001234567890):"
+                "حالا chat_id گروه را بفرست (مثلاً -1001234567890):"
             )
             return
         elif choice in ("2", "۲", "active"):
@@ -1330,7 +1296,7 @@ async def handle_state_message(event, state):
                 user_states.pop(user_id, None)
             return
 
-    # ====== خروج اعضا بر اساس همه‌ی اعضای گروه ======
+    # ====== گرفتن اعضای گروه با اکانت export (همه اعضا) ======
     if mode == "export_chat" and step == "chat_id":
         try:
             chat_id_val = int(text)
@@ -1416,7 +1382,7 @@ async def handle_state_message(event, state):
             traceback.print_exc()
         return
 
-    # ====== خروج اعضا بر اساس کسانی که پیام داده‌اند ======
+    # ====== گرفتن اعضای گروه بر اساس کسانی که پیام داده‌اند ======
     if mode == "export_chat_active" and step == "chat_id":
         try:
             chat_id_val = int(text)
@@ -1713,7 +1679,6 @@ async def main_handler(event):
                 delay = int(arg)
                 if delay < 1:
                     delay = 1
-                global INVITE_DELAY, INVITE_DELAY_MODE
                 INVITE_DELAY = delay
                 INVITE_DELAY_MODE = "fixed"
                 set_setting("invite_delay", str(INVITE_DELAY))
@@ -1783,7 +1748,6 @@ async def main_handler(event):
         if not acc:
             await event.reply("اکانت با این نام وجود ندارد.")
             return
-        global ACTIVE_ADD_ACCOUNT
         ACTIVE_ADD_ACCOUNT = name
         set_setting("active_add_account", name)
         await event.reply(f"✅ اکانت فعال (فقط نمایشی) تنظیم شد: {name}")
@@ -1877,7 +1841,6 @@ async def main_handler(event):
             )
             return
         target = groups_cache[idx]
-        global target_group, target_group_id, target_group_username, target_group_title
         target_group = target
         target_group_id = target.id
         target_group_username = getattr(target, "username", None)
@@ -1916,7 +1879,7 @@ async def main_handler(event):
         for i, a in enumerate(accounts):
             lines.append(f"{i}: {a['name']}  phone: {a['phone']}")
         lines.append(
-            '\nیک عدد برای انتخاب اکانت بفرست، یا عبارت "new" برای ساخت اکانت جدید بفرست:'
+            '\nیک عدد برای انتخاب اکانت بفرست، یا عبارت "new" برای ساخت اکانت جدید:'
         )
         await event.reply("\n".join(lines))
         return
