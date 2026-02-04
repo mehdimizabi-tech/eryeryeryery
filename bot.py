@@ -796,6 +796,59 @@ async def handle_state_message(event, state):
             await event.reply("شماره تلفن اکانت را با فرمت +98912... بفرست:")
             return
 
+
+        if step == "auth_method":
+            choice = text.strip()
+            if choice == "1":
+                state["step"] = "phone"
+                state["temp"] = temp
+                user_states[user_id] = state
+                await event.reply("شماره تلفن اکانت add را با فرمت +98912... بفرست:")
+                return
+            if choice == "2":
+                state["step"] = "session"
+                state["temp"] = temp
+                user_states[user_id] = state
+                await event.reply("رشته سشن (StringSession) را بفرست:")
+                return
+            await event.reply("فقط 1 یا 2 را بفرست.")
+            return
+
+        if step == "session":
+            session_text = text
+            name = temp["name"]
+            api_id = temp["api_id"]
+            api_hash = temp["api_hash"]
+            try:
+                acc_client = TelegramClient(StringSession(session_text), api_id, api_hash)
+                await acc_client.connect()
+                if not await acc_client.is_user_authorized():
+                    await event.reply("این سشن معتبر یا لاگین‌شده نیست.")
+                    await acc_client.disconnect()
+                    user_states.pop(user_id,None)
+                    return
+                me = await acc_client.get_me()
+                phone = getattr(me,"phone",None) or ""
+                session_string = acc_client.session.save()
+                await acc_client.disconnect()
+
+                acc_id = insert_account(name, phone, api_id, api_hash, session_string, "add")
+                ACCOUNTS_ADD.append({
+                    "id": acc_id,
+                    "name": name,
+                    "phone": phone,
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "session_string": session_string,
+                })
+                user_states.pop(user_id,None)
+                await event.reply(f"✅ اکانت {name} با سشن اضافه شد.")
+                await send_main_menu(chat_id)
+            except Exception as e:
+                await event.reply(f"خطا در سشن:\n{e}")
+                user_states.pop(user_id,None)
+            return
+
         if step == "phone":
             phone = text
             temp["phone"] = phone
