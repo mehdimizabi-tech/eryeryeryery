@@ -14,6 +14,7 @@ from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRe
 from telethon.tl.types import InputPeerEmpty, InputPeerUser, InputPeerChannel
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 from telethon.errors.rpcerrorlist import (
+    FloodWaitError,
     PeerFloodError,
     UserPrivacyRestrictedError,
     UserAlreadyParticipantError,
@@ -266,7 +267,7 @@ def get_add_account_by_name(name: str):
 def main_menu():
     return [
         [Button.text("➕ افزودن اکانت"), Button.text("📜 اکانت‌ها")],
-        [Button.text("🧾 شروع add"), Button.text("📤 خروج اعضا")],
+        [Button.text("🧾 شروع add"), Button.text("🧠 Add پیشرفته"), Button.text("📤 خروج اعضا")],
         [Button.text("⏱ تنظیم تاخیر"), Button.text("🗑 حذف اکانت add")],
         [Button.text("🚪 خروج اکانت‌های export"), Button.text("👥 جوین اکانت‌ها")],
         [Button.text("⛔ توقف add")],
@@ -409,7 +410,7 @@ async def join_all_add_accounts(group_link: str, chat_id: int):
 
 
 # ------------ ADD از روی CSV با تقسیم بین همه اکانت‌های add ------------
-async def add_users_from_csv_file(file_path, chat_id: int):
+async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
     global target_group, target_group_id, target_group_username, target_group_title
     global current_add_jobs
 
@@ -531,7 +532,12 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                 f"▶️ اکانت {name} شروع کرد. تعداد سهم این اکانت: {total_for_acc} کاربر.",
             )
 
-            for idx, user in enumerate(users_for_this_acc, start=1):
+            
+            index = 0
+            while index < len(users_for_this_acc):
+                user = users_for_this_acc[index]
+                idx = index + 1
+
                 if job.get("cancel"):
                     await client.send_message(
                         chat_id, f"⏹ اکانت {name} به درخواست شما متوقف شد."
@@ -558,6 +564,13 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                         chat_id, f"✅ [{name}] اضافه شد: {username_or_id}"
                     )
 
+                except FloodWaitError as e:
+                    wait_time = e.seconds
+                    extra = random.randint(1800, 7200) if advanced else 0
+                    total_wait = wait_time + extra
+                    await client.send_message(chat_id, f"⏳ [{name}] FloodWait: {wait_time}s → با تاخیر اضافه: {extra}s")
+                    await asyncio.sleep(total_wait)
+                    continue
                 except PeerFloodError:
                     await client.send_message(
                         chat_id,
@@ -600,6 +613,7 @@ async def add_users_from_csv_file(file_path, chat_id: int):
                         delay = 1
 
                 await asyncio.sleep(delay)
+                index += 1
 
             else:
                 await client.send_message(chat_id, f"⏹ اکانت {name} کارش تمام شد.")
@@ -746,7 +760,7 @@ async def handle_state_message(event, state):
         if lower in ["✅ شروع add".lower(), "شروع add", "شروع", "yes", "y"]:
             user_states.pop(user_id, None)
             await event.reply("✅ شروع فرآیند add از روی این CSV...")
-            await add_users_from_csv_file(file_path, chat_id)
+            await add_users_from_csv_file(file_path, chat_id, advanced=state.get("temp", {}).get("advanced", False) if "state" in locals() else False)
             return
         if lower in ["❌ انصراف".lower(), "انصراف", "cancel", "لغو"]:
             user_states.pop(user_id, None)
@@ -1858,6 +1872,27 @@ async def main_handler(event):
         for i, a in enumerate(names):
             lines.append(f"{i}: {a['name']}")
         lines.append("\nشماره اکانتی که می‌خوای حذف کنی رو بفرست:")
+        await event.reply("\n".join(lines))
+        return
+
+    
+    if text == "🧠 Add پیشرفته":
+        if not ACCOUNTS_ADD:
+            await event.reply("هیچ اکانتی برای add user ثبت نشده.")
+            return
+        accounts = get_export_accounts()
+        if not accounts:
+            await event.reply("هیچ اکانت export ثبت نشده.")
+            return
+        temp = {"accounts": accounts, "advanced": True}
+        user_states[user_id] = {
+            "mode": "add_choose_export",
+            "step": "choose",
+            "temp": temp,
+        }
+        lines = ["(حالت پیشرفته) اکانت export را انتخاب کن:"]
+        for i, a in enumerate(accounts):
+            lines.append(f"{i}: {a['name']}")
         await event.reply("\n".join(lines))
         return
 
