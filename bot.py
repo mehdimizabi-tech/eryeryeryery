@@ -61,6 +61,7 @@ target_group_title = None       # اسم گروه برای لاگ‌ها
 awaiting_group_number = False   # اگر True یعنی منتظر شماره گروه هستیم
 
 current_add_jobs = {}           # برای کنترل استاپ add به ازای هر چت
+pending_add_context = {}       # نگهداری تنظیمات شروع add (مثلاً حالت پیشرفته) به ازای هر چت
 
 
 # ------------ دیتابیس ------------
@@ -320,6 +321,41 @@ def parse_group_link(link: str):
     return "username", username
 
 
+async def controlled_sleep(total_seconds: int, job=None, step: int = 5):
+    remaining = max(0, int(total_seconds))
+    while remaining > 0:
+        if job and job.get("cancel"):
+            raise asyncio.CancelledError()
+        chunk = step if remaining > step else remaining
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+
+
+async def disconnect_client_safely(user_client):
+    try:
+        if user_client and user_client.is_connected():
+            await user_client.disconnect()
+    except Exception:
+        pass
+
+
+async def stop_add_job(job):
+    if not job:
+        return
+
+    job["cancel"] = True
+
+    tasks = list(job.get("tasks", set()))
+    clients = list(job.get("clients", set()))
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    for user_client in clients:
+        await disconnect_client_safely(user_client)
+
+
 # ------------ جوین همه اکانت‌های add به یک گروه ------------
 async def join_all_add_accounts(group_link: str, chat_id: int):
     if not ACCOUNTS_ADD:
@@ -412,7 +448,7 @@ async def join_all_add_accounts(group_link: str, chat_id: int):
 # ------------ ADD از روی CSV با تقسیم بین همه اکانت‌های add ------------
 async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
     global target_group, target_group_id, target_group_username, target_group_title
-    global current_add_jobs
+    global current_add_jobs, pending_add_context
 
     if not ACCOUNTS_ADD:
         await client.send_message(
@@ -462,7 +498,7 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
     total_users = len(users)
     total_accounts = len(ACCOUNTS_ADD)
 
-    job = {"cancel": False}
+    job = {"cancel": False, "tasks": set(), "clients": set()}
     current_add_jobs[chat_id] = job
 
     per_account_users = [[] for _ in range(total_accounts)]
@@ -487,6 +523,11 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
 
         session = StringSession(session_string)
         user_client = TelegramClient(session, api_id, api_hash)
+        current_task = asyncio.current_task()
+
+        if current_task:
+            job["tasks"].add(current_task)
+        job["clients"].add(user_client)
 
         try:
             await user_client.connect()
@@ -532,18 +573,16 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
                 f"▶️ اکانت {name} شروع کرد. تعداد سهم این اکانت: {total_for_acc} کاربر.",
             )
 
-            
             index = 0
             while index < len(users_for_this_acc):
-                user = users_for_this_acc[index]
-                idx = index + 1
-
                 if job.get("cancel"):
                     await client.send_message(
-                        chat_id, f"⏹ اکانت {name} به درخواست شما متوقف شد."
+                        chat_id, f"⏹ اکانت {name} به درخواست شما فوراً متوقف شد."
                     )
                     break
 
+                user = users_for_this_acc[index]
+                idx = index + 1
                 username_or_id = user["username"] or f"id:{user['id']}"
 
                 try:
@@ -552,14 +591,24 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
                         f"[{name} {idx}/{total_for_acc}] در حال اضافه کردن: {username_or_id}",
                     )
 
+                    if job.get("cancel"):
+                        raise asyncio.CancelledError()
+
                     if user["username"]:
                         user_entity = await user_client.get_input_entity(user["username"])
                     else:
                         user_entity = InputPeerUser(user["id"], user["access_hash"])
 
+                    if job.get("cancel"):
+                        raise asyncio.CancelledError()
+
                     await user_client(
                         InviteToChannelRequest(target_entity, [user_entity])
                     )
+
+                    if job.get("cancel"):
+                        raise asyncio.CancelledError()
+
                     await client.send_message(
                         chat_id, f"✅ [{name}] اضافه شد: {username_or_id}"
                     )
@@ -568,8 +617,24 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
                     wait_time = e.seconds
                     extra = random.randint(1800, 7200) if advanced else 0
                     total_wait = wait_time + extra
-                    await client.send_message(chat_id, f"⏳ [{name}] FloodWait: {wait_time}s → با تاخیر اضافه: {extra}s")
-                    await asyncio.sleep(total_wait)
+
+                    if advanced:
+                        await client.send_message(
+                            chat_id,
+                            f"⏳ [{name}] FloodWait: {wait_time}s\n"
+                            f"بعد از اتمام FloodWait، {extra}s "
+                            "اضافه به صورت رندوم (بین 30 تا 120 دقیقه) صبر می‌کنم.",
+                        )
+                    else:
+                        await client.send_message(
+                            chat_id,
+                            f"⏳ [{name}] FloodWait: {wait_time}s",
+                        )
+
+                    if job.get("cancel"):
+                        raise asyncio.CancelledError()
+
+                    await controlled_sleep(total_wait, job=job)
                     continue
                 except PeerFloodError:
                     await client.send_message(
@@ -591,6 +656,12 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
                         "پیشنهاد: از «👥 جوین اکانت‌ها» استفاده کن و مطمئن شو این اکانت عضو همون گروهه.",
                     )
                     break
+                except asyncio.CancelledError:
+                    await client.send_message(
+                        chat_id,
+                        f"⏹ اکانت {name} فوراً متوقف شد.",
+                    )
+                    break
                 except Exception as e:
                     await client.send_message(
                         chat_id,
@@ -600,7 +671,7 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
 
                 if job.get("cancel"):
                     await client.send_message(
-                        chat_id, f"⏹ اکانت {name} به درخواست شما متوقف شد."
+                        chat_id, f"⏹ اکانت {name} به درخواست شما فوراً متوقف شد."
                     )
                     break
 
@@ -612,18 +683,28 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
                     if delay < 1:
                         delay = 1
 
-                await asyncio.sleep(delay)
+                await controlled_sleep(delay, job=job)
                 index += 1
 
             else:
                 await client.send_message(chat_id, f"⏹ اکانت {name} کارش تمام شد.")
 
+        except asyncio.CancelledError:
+            try:
+                await client.send_message(
+                    chat_id, f"⏹ اکانت {name} فوراً متوقف شد."
+                )
+            except Exception:
+                pass
         except Exception as e:
             await client.send_message(
                 chat_id, f"❌ خطای کلی برای اکانت {name}:\n{e}"
             )
             traceback.print_exc()
         finally:
+            job["clients"].discard(user_client)
+            if current_task:
+                job["tasks"].discard(current_task)
             try:
                 await user_client.disconnect()
             except Exception:
@@ -641,10 +722,14 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
         )
         return
 
-    await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in results:
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+            traceback.print_exception(type(result), result, result.__traceback__)
 
     if job.get("cancel"):
-        await client.send_message(chat_id, "⛔ فرآیند add به درخواست شما متوقف شد.")
+        await client.send_message(chat_id, "⛔ فرآیند add به درخواست شما فوراً متوقف شد.")
     else:
         await client.send_message(
             chat_id, "✅ فرآیند add با همه اکانت‌ها تمام شد."
@@ -657,7 +742,7 @@ async def add_users_from_csv_file(file_path, chat_id: int, advanced=False):
 async def handle_state_message(event, state):
     global INVITE_DELAY, ACTIVE_ADD_ACCOUNT, ACCOUNTS_ADD, INVITE_DELAY_MODE
     global groups_cache, awaiting_group_number, target_group
-    global target_group_id, target_group_username, target_group_title
+    global target_group_id, target_group_username, target_group_title, pending_add_context
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -731,6 +816,9 @@ async def handle_state_message(event, state):
                 "بعد از انتخاب گروه، فایل CSV را بفرست تا add انجام شود."
             )
 
+            pending_add_context[chat_id] = {
+                "advanced": bool(temp.get("advanced", False))
+            }
             awaiting_group_number = True
             user_states.pop(user_id, None)
             await event.reply("\n".join(lines), parse_mode="markdown")
@@ -758,9 +846,10 @@ async def handle_state_message(event, state):
         file_path = temp.get("file_path")
         lower = text.strip().lower()
         if lower in ["✅ شروع add".lower(), "شروع add", "شروع", "yes", "y"]:
+            advanced_mode = bool(temp.get("advanced", False))
             user_states.pop(user_id, None)
             await event.reply("✅ شروع فرآیند add از روی این CSV...")
-            await add_users_from_csv_file(file_path, chat_id, advanced=state.get("temp", {}).get("advanced", False) if "state" in locals() else False)
+            await add_users_from_csv_file(file_path, chat_id, advanced=advanced_mode)
             return
         if lower in ["❌ انصراف".lower(), "انصراف", "cancel", "لغو"]:
             user_states.pop(user_id, None)
@@ -1606,7 +1695,7 @@ async def main_handler(event):
     global awaiting_group_number, target_group, target_group_id
     global target_group_username, target_group_title
     global ACTIVE_ADD_ACCOUNT, INVITE_DELAY, ACCOUNTS_ADD, INVITE_DELAY_MODE
-    global current_add_jobs
+    global current_add_jobs, pending_add_context
 
     user_id = event.sender_id
     chat_id = event.chat_id
@@ -1667,7 +1756,12 @@ async def main_handler(event):
                 user_states[user_id] = {
                     "mode": "confirm_add_csv",
                     "step": "confirm",
-                    "temp": {"file_path": file_path},
+                    "temp": {
+                        "file_path": file_path,
+                        "advanced": bool(
+                            pending_add_context.get(chat_id, {}).get("advanced", False)
+                        ),
+                    },
                 }
                 await event.reply(
                     "فایل CSV دانلود شد.\n"
@@ -1696,10 +1790,10 @@ async def main_handler(event):
                 "الان هیچ فرآیند add فعالی برای این چت در حال اجرا نیست."
             )
         else:
-            job["cancel"] = True
+            await stop_add_job(job)
             await event.reply(
-                "⛔ درخواست توقف ثبت شد.\n"
-                "اکانت‌ها بعد از تمام کردن کار روی یوزر فعلی متوقف می‌شوند."
+                "⛔ درخواست توقف اعمال شد.\n"
+                "همه فرآیندهای add همین حالا متوقف شدند."
             )
         return
 
@@ -1939,6 +2033,7 @@ async def main_handler(event):
         target_group_id = target.id
         target_group_username = getattr(target, "username", None)
         target_group_title = getattr(target, "title", "گروه")
+        pending_add_context[chat_id] = pending_add_context.get(chat_id, {"advanced": False})
         awaiting_group_number = False
         await event.reply(
             f"✅ گروه برای add user انتخاب شد:\n{target_group_title}\n"
